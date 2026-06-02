@@ -110,8 +110,12 @@ QSlider::groove:horizontal { height: 4px; background: rgba(255, 255, 255, 0.2); 
 QSlider::sub-page:horizontal { background: #ff00ea; } 
 QSlider::handle:horizontal { background: #00f3ff; width: 10px; height: 10px; margin: -3px 0; border-radius: 5px; }
 
-#TimeLabel, #SubStatusLabel { color: #888; font-family: 'Consolas'; font-size: 12px; }
+#VolumeSlider::sub-page:horizontal { background: #00f3ff; }
+#VolumeSlider::handle:horizontal { background: #ff00ea; }
+
+#TimeLabel, #SubStatusLabel, #VolumeLabel { color: #888; font-family: 'Consolas'; font-size: 12px; }
 #SubStatusLabel { color: #666; margin-left: 15px; }
+#VolumeLabel { color: #00f3ff; font-weight: bold; margin-left: 10px; }
 
 QMessageBox { background-color: #0a0a0a; border: 1px solid #ff00ea; }
 QMessageBox QLabel { color: #00f3ff; font-family: 'Consolas'; }
@@ -155,6 +159,40 @@ class TimelineSlider(QSlider):
         else:
             super().mouseReleaseEvent(event)
 
+# --- FIXED: VOLUME SLIDER CLASS RESTORES DRAG CAPTURE TRACKING MECHANICS ---
+class VolumeSlider(QSlider):
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.is_user_dragging = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_user_dragging = True
+            val = self.minimum() + ((self.maximum() - self.minimum()) * event.position().x()) / self.width()
+            val = max(self.minimum(), min(self.maximum(), int(val)))
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.is_user_dragging:
+            val = self.minimum() + ((self.maximum() - self.minimum()) * event.position().x()) / self.width()
+            val = max(self.minimum(), min(self.maximum(), int(val)))
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_user_dragging = False
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
 class CyberPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -168,17 +206,18 @@ class CyberPlayer(QMainWindow):
         self.custom_subs_map = {} 
         self.playback_positions = {} 
         
-        self.init_ui()
-        
         # --- UI State Initialization Defaults ---
         self.current_sub_size = 36
         self.current_sub_color = "#00f3ff" 
         self.current_sub_font = "Consolas" 
+        self.current_volume = 100  
         self.last_known_text = "" 
         self.active_media_path = None
         self.is_awaiting_resume = False 
         self.pending_resume_seconds = 0.0 
         self.is_initializing = True  
+        
+        self.init_ui()
         
         # Initialize MPV Engine
         self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), force_window=True, keep_open='yes')
@@ -195,6 +234,15 @@ class CyberPlayer(QMainWindow):
         
         last_played_media = self.load_configuration_memory()
         self.update_sub_styles() 
+        
+        # Assign initial volume configuration preference metrics onto tracking layout components
+        self.current_volume = max(0, min(100, int(self.current_volume)))
+        self.volume_slider.setValue(self.current_volume)
+        self.volume_label.setText(f"VOL: {self.current_volume}%")
+        try:
+            self.player.volume = float(self.calculate_boosted_volume(self.current_volume))
+        except:
+            pass
         
         # Global Hotkeys
         self.shortcut_right = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
@@ -277,7 +325,7 @@ class CyberPlayer(QMainWindow):
         
         viewport_container = QWidget()
         viewport_layout = QVBoxLayout(viewport_container)
-        viewport_layout.setContentsMargins(0, 0, 0, 0)
+        viewport_container.setContentsMargins(0, 0, 0, 0)
         viewport_layout.setSpacing(0)
         
         self.video_frame = QWidget()
@@ -321,6 +369,18 @@ class CyberPlayer(QMainWindow):
         self.time_label = QLabel("00:00:00.00 / 00:00:00.00")
         self.time_label.setObjectName("TimeLabel")
         controls_layout.addWidget(self.time_label)
+        
+        # Volume slider instantiated using updated wrapper class
+        self.volume_slider = VolumeSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setObjectName("VolumeSlider")
+        self.volume_slider.setRange(0, 100) 
+        self.volume_slider.setFixedWidth(80)
+        self.volume_slider.sliderMoved.connect(self.adjust_system_volume)
+        controls_layout.addWidget(self.volume_slider)
+        
+        self.volume_label = QLabel("VOL: 100%")
+        self.volume_label.setObjectName("VolumeLabel")
+        controls_layout.addWidget(self.volume_label)
         
         self.sub_status_label = QLabel("SUBTITLE: NONE")
         self.sub_status_label.setObjectName("SubStatusLabel")
@@ -389,6 +449,7 @@ class CyberPlayer(QMainWindow):
             self.current_sub_font = memory.get("font_family", "Consolas")
             self.current_sub_size = memory.get("font_size", 36)
             self.current_sub_color = memory.get("font_color", "#00f3ff")
+            self.current_volume = memory.get("system_volume_level", 100) 
             
             raw_positions = memory.get("playback_positions", {})
             self.playback_positions = {k.lower().replace('\\', '/'): v for k, v in raw_positions.items()}
@@ -444,6 +505,7 @@ class CyberPlayer(QMainWindow):
             "font_family": self.current_sub_font,
             "font_size": self.current_sub_size,
             "font_color": self.current_sub_color,
+            "system_volume_level": int(self.current_volume), 
             "last_active_media_file": self.active_media_path if self.active_media_path else on_disk_memory.get("last_active_media_file", None),
             "media_files_playlist": merged_media_playlist,
             "subtitle_files_playlist": merged_sub_playlist,
@@ -458,6 +520,24 @@ class CyberPlayer(QMainWindow):
 
     def safely_handle_app_exit(self):
         self.close()
+
+    # --- FIXED: IMPLEMENTED THE +40 FLAT OFFSET FLOOR SHIFT REQUEST LOGIC SMOOTHLY ---
+    def calculate_boosted_volume(self, value):
+        if value <= 0:
+            return 0.0
+        # Flat hardware offset shift keeps things clear across lower levels
+        # scaling predictably through to the top layout bounds max.
+        boosted_value = float(value + 40)
+        return min(100.0, boosted_value)
+
+    def adjust_system_volume(self, value):
+        try:
+            self.current_volume = int(value) 
+            self.volume_label.setText(f"VOL: {self.current_volume}%")
+            self.player.volume = float(self.calculate_boosted_volume(self.current_volume))
+            self.save_configuration_memory()
+        except:
+            pass
 
     def adjust_sub_size(self, delta):
         self.current_sub_size = max(12, min(72, self.current_sub_size + delta))
@@ -533,7 +613,8 @@ class CyberPlayer(QMainWindow):
             try:
                 dur = self.player.duration
                 pos = self.player.time_pos
-                if dur is not None and pos is not None and dur > 0:
+                if dur == 0 or pos is None: return
+                if dur > 0:
                     target = self.pending_resume_seconds
                     self.pending_resume_seconds = 0.0
                     self.is_awaiting_resume = False 
