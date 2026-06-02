@@ -3,8 +3,16 @@ import os
 import time
 import json
 
-# Tell Python where MPV is located
-os.environ["PATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ["PATH"]
+# --- FREEZE-PROOF SYSTEM PATH ANCHOR ---
+# This forces the application to always find its assets right next to the 
+# true executable file, completely bypassing Windows context directory redirects.
+if getattr(sys, 'frozen', False):
+    exe_dir = os.path.dirname(sys.executable)
+else:
+    exe_dir = os.path.dirname(os.path.abspath(__file__))
+
+os.environ["PATH"] = exe_dir + os.pathsep + os.environ["PATH"]
+CONFIG_FILE = os.path.join(exe_dir, "config.json")
 
 import mpv
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
@@ -13,8 +21,6 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QShortcut, QKeySequence, QIcon, QPixmap, QColor, QFont
 from PyQt6.QtSvg import QSvgRenderer
-
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 # --- CYBERPUNK MULTI-PANEL DECK SKIN ---
 STYLESHEET = """
@@ -115,7 +121,6 @@ QMessageBox QPushButton { color: #00f3ff; border: 1px solid #00f3ff; padding: 4p
 SVG_PLAY = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#00f3ff"><path d="M8 5v14l11-7z"/></svg>'
 SVG_PAUSE = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#00f3ff"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>'
 
-# --- HIGH-RESOLUTION MILLISECOND CONTROLLER SLIDER ---
 class TimelineSlider(QSlider):
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
@@ -384,20 +389,27 @@ class CyberPlayer(QMainWindow):
             self.current_sub_font = memory.get("font_family", "Consolas")
             self.current_sub_size = memory.get("font_size", 36)
             self.current_sub_color = memory.get("font_color", "#00f3ff")
-            self.playback_positions = memory.get("playback_positions", {})
-            self.custom_subs_map = memory.get("custom_subs_map", {})
+            
+            raw_positions = memory.get("playback_positions", {})
+            self.playback_positions = {k.lower().replace('\\', '/'): v for k, v in raw_positions.items()}
+            
+            raw_subs_map = memory.get("custom_subs_map", {})
+            self.custom_subs_map = {k.lower().replace('\\', '/'): v.lower().replace('\\', '/') for k, v in raw_subs_map.items()}
             
             for path in memory.get("media_files_playlist", []):
-                if os.path.exists(path) and path not in self.media_files:
-                    self.media_files.append(path)
-                    self.file_list.addItem(os.path.basename(path))
+                norm_path = path.lower().replace('\\', '/')
+                if os.path.exists(norm_path) and norm_path not in self.media_files:
+                    self.media_files.append(norm_path)
+                    self.file_list.addItem(os.path.basename(norm_path))
                     
             for path in memory.get("subtitle_files_playlist", []):
-                if os.path.exists(path) and path not in self.subtitle_files:
-                    self.subtitle_files.append(path)
-                    self.sub_list.addItem(os.path.basename(path))
-                    
-            return memory.get("last_active_media_file", None)
+                norm_path = path.lower().replace('\\', '/')
+                if os.path.exists(norm_path) and norm_path not in self.subtitle_files:
+                    self.subtitle_files.append(norm_path)
+                    self.sub_list.addItem(os.path.basename(norm_path))
+            
+            last_active = memory.get("last_active_media_file", None)
+            return last_active.lower().replace('\\', '/') if last_active else None
         except Exception as e:
             print(f"Memory extraction read break: {e}")
             return None
@@ -416,14 +428,17 @@ class CyberPlayer(QMainWindow):
             except:
                 pass
 
-        merged_media_playlist = list(set(self.media_files + on_disk_memory.get("media_files_playlist", [])))
-        merged_sub_playlist = list(set(self.subtitle_files + on_disk_memory.get("subtitle_files_playlist", [])))
+        disk_media_playlist = [p.lower().replace('\\', '/') for p in on_disk_memory.get("media_files_playlist", [])]
+        disk_sub_playlist = [p.lower().replace('\\', '/') for p in on_disk_memory.get("subtitle_files_playlist", [])]
         
-        merged_positions = on_disk_memory.get("playback_positions", {})
-        merged_positions.update(self.playback_positions)
+        merged_media_playlist = list(set(self.media_files + disk_media_playlist))
+        merged_sub_playlist = list(set(self.subtitle_files + disk_sub_playlist))
         
-        merged_subs_map = on_disk_memory.get("custom_subs_map", {})
-        merged_subs_map.update(self.custom_subs_map)
+        disk_positions = {k.lower().replace('\\', '/'): v for k, v in on_disk_memory.get("playback_positions", {}).items()}
+        disk_positions.update(self.playback_positions)
+        
+        disk_subs_map = {k.lower().replace('\\', '/'): v.lower().replace('\\', '/') for k, v in on_disk_memory.get("custom_subs_map", {}).items()}
+        disk_subs_map.update(self.custom_subs_map)
 
         memory_payload = {
             "font_family": self.current_sub_font,
@@ -432,8 +447,8 @@ class CyberPlayer(QMainWindow):
             "last_active_media_file": self.active_media_path if self.active_media_path else on_disk_memory.get("last_active_media_file", None),
             "media_files_playlist": merged_media_playlist,
             "subtitle_files_playlist": merged_sub_playlist,
-            "custom_subs_map": merged_subs_map,
-            "playback_positions": merged_positions
+            "custom_subs_map": disk_subs_map,
+            "playback_positions": disk_positions
         }
         try:
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -513,7 +528,6 @@ class CyberPlayer(QMainWindow):
         )
         self.pyqt_sub_label.setStyleSheet(inline_css)
 
-    # --- MAIN THREAD TIMELINE ENGINE LOOP ---
     def update_timeline(self):
         if self.is_awaiting_resume and not self.slider.is_user_dragging:
             try:
@@ -535,7 +549,6 @@ class CyberPlayer(QMainWindow):
                 pos = self.player.time_pos
                 dur = self.player.duration
                 if pos is not None and dur is not None and dur > 0:
-                    # FIX: Scale range maximum by 100 to allocate 100 fractional steps inside every second
                     scaled_max = int(dur * 100)
                     scaled_pos = int(pos * 100)
                     
@@ -575,7 +588,6 @@ class CyberPlayer(QMainWindow):
     def skip_backward(self):
         if self.player.time_pos is not None: self.player.time_pos = max(0.0, self.player.time_pos - 5.0)
 
-    # FIX: Refactored time formatter now renders live millisecond fractions (.00)
     def format_time(self, total_seconds):
         if total_seconds is None: return "00:00:00.00"
         total_milliseconds = int(total_seconds * 100)
@@ -584,7 +596,6 @@ class CyberPlayer(QMainWindow):
         hours, minutes = divmod(minutes, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{hundredths:02d}"
 
-    # FIX: Downscales high-resolution slider values by 100.0 to parse fluid timestamps
     def preview_time(self, scaled_value):
         try:
             dur = self.player.duration
@@ -594,7 +605,6 @@ class CyberPlayer(QMainWindow):
         except:
             pass
 
-    # FIX: Downscales final release position to map precise float tracking properties onto MPV
     def apply_video_position(self):
         try:
             if self.player.duration is not None: 
@@ -613,9 +623,10 @@ class CyberPlayer(QMainWindow):
             self.play_file(filepath)
 
     def add_to_playlist(self, filepath):
-        if filepath not in self.media_files:
-            self.media_files.append(filepath)
-            self.file_list.addItem(os.path.basename(filepath))
+        norm_path = filepath.lower().replace('\\', '/')
+        if norm_path not in self.media_files:
+            self.media_files.append(norm_path)
+            self.file_list.addItem(os.path.basename(norm_path))
             self.save_configuration_memory()
 
     def play_from_list(self, item):
@@ -631,9 +642,10 @@ class CyberPlayer(QMainWindow):
             self.load_subtitle_from_path(filepath)
 
     def add_subtitle_to_playlist(self, filepath):
-        if filepath not in self.subtitle_files:
-            self.subtitle_files.append(filepath)
-            self.sub_list.addItem(os.path.basename(filepath))
+        norm_path = filepath.lower().replace('\\', '/')
+        if norm_path not in self.subtitle_files:
+            self.subtitle_files.append(norm_path)
+            self.sub_list.addItem(os.path.basename(norm_path))
             self.save_configuration_memory()
 
     def play_sub_from_list(self, item):
@@ -643,14 +655,15 @@ class CyberPlayer(QMainWindow):
                 break
 
     def load_subtitle_from_path(self, filepath):
-        if os.path.exists(filepath):
+        norm_path = filepath.lower().replace('\\', '/')
+        if os.path.exists(norm_path):
             try:
-                self.player.sub_add(filepath)
-                filename = os.path.basename(filepath)
+                self.player.sub_add(norm_path)
+                filename = os.path.basename(norm_path)
                 self.sub_status_label.setText(f"SUBTITLE: {filename.upper()}")
                 self.sub_status_label.setStyleSheet("color: #ff00ea; font-weight: bold;")
                 if self.active_media_path:
-                    self.custom_subs_map[self.active_media_path] = filepath
+                    self.custom_subs_map[self.active_media_path] = norm_path
                     self.save_configuration_memory()
             except:
                 pass
@@ -660,6 +673,8 @@ class CyberPlayer(QMainWindow):
         self.is_awaiting_resume = False
         self.pending_resume_seconds = 0.0
         
+        norm_path = filepath.lower().replace('\\', '/')
+        
         if self.active_media_path and hasattr(self, 'player'):
             try:
                 pos = self.player.time_pos
@@ -668,10 +683,10 @@ class CyberPlayer(QMainWindow):
             except:
                 pass
             
-        self.active_media_path = filepath
+        self.active_media_path = norm_path
         
         try:
-            self.player.play(filepath)
+            self.player.play(norm_path)
             self.player.pause = False
             self.set_vector_icon(self.play_btn, SVG_PAUSE)
         except Exception as e:
@@ -679,16 +694,16 @@ class CyberPlayer(QMainWindow):
 
         self.update_sub_styles()
 
-        if filepath in self.custom_subs_map:
-            saved_sub_path = self.custom_subs_map[filepath]
+        if norm_path in self.custom_subs_map:
+            saved_sub_path = self.custom_subs_map[norm_path]
             self.load_subtitle_from_path(saved_sub_path)
         else:
             self.sub_status_label.setText("SUBTITLE: NONE")
             self.sub_status_label.setStyleSheet("color: #666;")
             self.pyqt_sub_label.hide()
 
-        if filepath in self.playback_positions:
-            saved_seconds = self.playback_positions[filepath]
+        if norm_path in self.playback_positions:
+            saved_seconds = self.playback_positions[norm_path]
             if saved_seconds > 0.5:
                 self.pending_resume_seconds = saved_seconds
                 self.is_awaiting_resume = True
@@ -697,7 +712,7 @@ class CyberPlayer(QMainWindow):
         else:
             self.is_initializing = False 
 
-        self.handle_visual_frame_adjustments(filepath)
+        self.handle_visual_frame_adjustments(norm_path)
         self.save_configuration_memory()
 
     def handle_visual_frame_adjustments(self, filepath):
@@ -772,8 +787,15 @@ class CyberPlayer(QMainWindow):
             self.move(self.x() + delta.x(), self.y() + delta.y())
             self.oldPos = event.globalPosition().toPoint()
 
+# --- WINDOWS BOOTSTRAP INTERCEPTOR ---
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     player = CyberPlayer()
     player.show()
+    
+    if len(sys.argv) > 1:
+        target_file = os.path.normpath(sys.argv[1]).lower().replace('\\', '/')
+        if os.path.exists(target_file):
+            QTimer.singleShot(250, lambda: player.play_file(target_file))
+            
     sys.exit(app.exec())
