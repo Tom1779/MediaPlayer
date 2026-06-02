@@ -4,8 +4,6 @@ import time
 import json
 
 # --- FREEZE-PROOF SYSTEM PATH ANCHOR ---
-# This forces the application to always find its assets right next to the 
-# true executable file, completely bypassing Windows context directory redirects.
 if getattr(sys, 'frozen', False):
     exe_dir = os.path.dirname(sys.executable)
 else:
@@ -159,7 +157,6 @@ class TimelineSlider(QSlider):
         else:
             super().mouseReleaseEvent(event)
 
-# --- FIXED: VOLUME SLIDER CLASS RESTORES DRAG CAPTURE TRACKING MECHANICS ---
 class VolumeSlider(QSlider):
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
@@ -220,7 +217,7 @@ class CyberPlayer(QMainWindow):
         self.init_ui()
         
         # Initialize MPV Engine
-        self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), force_window=True, keep_open='yes')
+        self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), force_window=True, keep_open='yes', volume_max=150.0)
         
         try:
             self.player.sub_use_osd = True
@@ -235,7 +232,6 @@ class CyberPlayer(QMainWindow):
         last_played_media = self.load_configuration_memory()
         self.update_sub_styles() 
         
-        # Assign initial volume configuration preference metrics onto tracking layout components
         self.current_volume = max(0, min(100, int(self.current_volume)))
         self.volume_slider.setValue(self.current_volume)
         self.volume_label.setText(f"VOL: {self.current_volume}%")
@@ -256,7 +252,11 @@ class CyberPlayer(QMainWindow):
         self.timer.timeout.connect(self.update_timeline)
         self.timer.start()
         
-        if last_played_media and os.path.exists(last_played_media):
+        # If launched via "Open With" (sys.argv), skip restoring last session —
+        # the argv file will be played directly from __main__ instead.
+        if len(sys.argv) > 1:
+            self.is_initializing = False
+        elif last_played_media and os.path.exists(last_played_media):
             QTimer.singleShot(200, lambda: self.play_file(last_played_media))
         else:
             self.is_initializing = False
@@ -370,7 +370,6 @@ class CyberPlayer(QMainWindow):
         self.time_label.setObjectName("TimeLabel")
         controls_layout.addWidget(self.time_label)
         
-        # Volume slider instantiated using updated wrapper class
         self.volume_slider = VolumeSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setObjectName("VolumeSlider")
         self.volume_slider.setRange(0, 100) 
@@ -521,12 +520,9 @@ class CyberPlayer(QMainWindow):
     def safely_handle_app_exit(self):
         self.close()
 
-    # --- FIXED: IMPLEMENTED THE +40 FLAT OFFSET FLOOR SHIFT REQUEST LOGIC SMOOTHLY ---
     def calculate_boosted_volume(self, value):
         if value <= 0:
             return 0.0
-        # Flat hardware offset shift keeps things clear across lower levels
-        # scaling predictably through to the top layout bounds max.
         boosted_value = float(value + 40)
         return min(100.0, boosted_value)
 
@@ -579,19 +575,22 @@ class CyberPlayer(QMainWindow):
         return f"00{b}{g}{r}".upper()
 
     def update_sub_styles(self):
-        self.player.sub_font = self.current_sub_font
-        self.player.sub_font_size = self.current_sub_size
-        self.player.sub_color = self.current_sub_color  
-        self.player.sub_border_color = '#000000'
-        self.player.sub_border_size = 2
-        
-        self.player._set_property('osd-font', self.current_sub_font)
-        self.player._set_property('osd-font-size', str(self.current_sub_size))
-        
-        mpv_ready_bgr_hex = self.convert_rgb_to_mpv_hex(self.current_sub_color)
-        self.player._set_property('osd-color', f"#{mpv_ready_bgr_hex}")
-        self.player._set_property('osd-border-color', '#000000')
-        self.player._set_property('osd-border-size', '1') 
+        try:
+            self.player._set_property('sub-font', self.current_sub_font)
+            self.player._set_property('sub-font-size', str(self.current_sub_size))
+            self.player._set_property('sub-color', self.current_sub_color)
+            self.player._set_property('sub-border-color', '#000000')
+            self.player._set_property('sub-border-size', '2')
+            
+            self.player._set_property('osd-font', self.current_sub_font)
+            self.player._set_property('osd-font-size', str(self.current_sub_size))
+            
+            mpv_ready_bgr_hex = self.convert_rgb_to_mpv_hex(self.current_sub_color)
+            self.player._set_property('osd-color', f"#{mpv_ready_bgr_hex}")
+            self.player._set_property('osd-border-color', '#000000')
+            self.player._set_property('osd-border-size', '1') 
+        except:
+            pass
         
         if self.last_known_text:
             self.refresh_pyqt_label_styling()
@@ -700,7 +699,6 @@ class CyberPlayer(QMainWindow):
     def load_media(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Select Media", "", "Media (*.mp4 *.mkv *.avi *.mp3 *.flac *.wav)")
         if filepath:
-            self.add_to_playlist(filepath)
             self.play_file(filepath)
 
     def add_to_playlist(self, filepath):
@@ -708,7 +706,9 @@ class CyberPlayer(QMainWindow):
         if norm_path not in self.media_files:
             self.media_files.append(norm_path)
             self.file_list.addItem(os.path.basename(norm_path))
-            self.save_configuration_memory()
+            
+            if not self.is_initializing:
+                self.save_configuration_memory()
 
     def play_from_list(self, item):
         for path in self.media_files:
@@ -756,6 +756,12 @@ class CyberPlayer(QMainWindow):
         
         norm_path = filepath.lower().replace('\\', '/')
         
+        # Look up the bookmark value FIRST using direct dictionary lookup parameters
+        target_timestamp = self.playback_positions.get(norm_path, 0.0)
+        
+        # Now add to the playlist layout history elements safely
+        self.add_to_playlist(norm_path)
+        
         if self.active_media_path and hasattr(self, 'player'):
             try:
                 pos = self.player.time_pos
@@ -783,13 +789,10 @@ class CyberPlayer(QMainWindow):
             self.sub_status_label.setStyleSheet("color: #666;")
             self.pyqt_sub_label.hide()
 
-        if norm_path in self.playback_positions:
-            saved_seconds = self.playback_positions[norm_path]
-            if saved_seconds > 0.5:
-                self.pending_resume_seconds = saved_seconds
-                self.is_awaiting_resume = True
-            else:
-                self.is_initializing = False 
+        # Check if the database lookup position is validly past 0.5s
+        if target_timestamp > 0.5:
+            self.pending_resume_seconds = target_timestamp
+            self.is_awaiting_resume = True
         else:
             self.is_initializing = False 
 
