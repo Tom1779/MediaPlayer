@@ -115,30 +115,37 @@ QMessageBox QPushButton { color: #00f3ff; border: 1px solid #00f3ff; padding: 4p
 SVG_PLAY = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#00f3ff"><path d="M8 5v14l11-7z"/></svg>'
 SVG_PAUSE = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#00f3ff"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>'
 
+# --- HIGH-RESOLUTION MILLISECOND CONTROLLER SLIDER ---
 class TimelineSlider(QSlider):
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.is_user_dragging = False
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self.is_user_dragging = True
             val = self.minimum() + ((self.maximum() - self.minimum()) * event.position().x()) / self.width()
-            val = max(self.minimum(), min(self.maximum(), val))
-            self.setValue(int(val))
-            self.sliderMoved.emit(int(val))
+            val = max(self.minimum(), min(self.maximum(), int(val)))
+            self.setValue(val)
+            self.sliderMoved.emit(val)
             event.accept()
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.MouseButton.LeftButton:
+        if self.is_user_dragging:
             val = self.minimum() + ((self.maximum() - self.minimum()) * event.position().x()) / self.width()
-            val = max(self.minimum(), min(self.maximum(), val))
-            self.setValue(int(val))
-            self.sliderMoved.emit(int(val))
+            val = max(self.minimum(), min(self.maximum(), int(val)))
+            self.setValue(val)
+            self.sliderMoved.emit(val)
             event.accept()
         else:
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.sliderReleased.emit() 
+            self.is_user_dragging = False
+            self.sliderReleased.emit()
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -158,7 +165,7 @@ class CyberPlayer(QMainWindow):
         
         self.init_ui()
         
-        # --- UI State Initialization ---
+        # --- UI State Initialization Defaults ---
         self.current_sub_size = 36
         self.current_sub_color = "#00f3ff" 
         self.current_sub_font = "Consolas" 
@@ -166,7 +173,7 @@ class CyberPlayer(QMainWindow):
         self.active_media_path = None
         self.is_awaiting_resume = False 
         self.pending_resume_seconds = 0.0 
-        self.is_initializing = True 
+        self.is_initializing = True  
         
         # Initialize MPV Engine
         self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), force_window=True, keep_open='yes')
@@ -181,7 +188,6 @@ class CyberPlayer(QMainWindow):
         self.player._set_property('osd-border-size', '3')
         self.player._set_property('osd-margin-y', '45')
         
-        # Unpack stored system memory attributes
         last_played_media = self.load_configuration_memory()
         self.update_sub_styles() 
         
@@ -197,7 +203,6 @@ class CyberPlayer(QMainWindow):
         self.timer.timeout.connect(self.update_timeline)
         self.timer.start()
         
-        # Safe initial startup boot loader deployment pass
         if last_played_media and os.path.exists(last_played_media):
             QTimer.singleShot(200, lambda: self.play_file(last_played_media))
         else:
@@ -210,7 +215,7 @@ class CyberPlayer(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         
-        # --- LEFT SIDE PANEL (SPLIT VAULT DECK) ---
+        # --- LEFT SIDE PANEL ---
         side_panel = QWidget()
         side_panel.setObjectName("SidePanel")
         side_panel.setFixedWidth(260)
@@ -308,7 +313,7 @@ class CyberPlayer(QMainWindow):
         self.play_btn.clicked.connect(self.toggle_play)
         controls_layout.addWidget(self.play_btn)
         
-        self.time_label = QLabel("00:00:00 / 00:00:00")
+        self.time_label = QLabel("00:00:00.00 / 00:00:00.00")
         self.time_label.setObjectName("TimeLabel")
         controls_layout.addWidget(self.time_label)
         
@@ -370,7 +375,6 @@ class CyberPlayer(QMainWindow):
         
         button.setIcon(QIcon(pixmap))
 
-    # --- CONFIGURATION ENGINE PERSISTENCE SYSTEM ---
     def load_configuration_memory(self):
         if not os.path.exists(CONFIG_FILE): return None
         try:
@@ -440,7 +444,6 @@ class CyberPlayer(QMainWindow):
     def safely_handle_app_exit(self):
         self.close()
 
-    # --- LAYOUT STYLING CODES ---
     def adjust_sub_size(self, delta):
         self.current_sub_size = max(12, min(72, self.current_sub_size + delta))
         self.update_sub_styles()
@@ -483,7 +486,9 @@ class CyberPlayer(QMainWindow):
     def update_sub_styles(self):
         self.player.sub_font = self.current_sub_font
         self.player.sub_font_size = self.current_sub_size
-        self.player.sub_color = self.current_sub_color
+        self.player.sub_color = self.current_sub_color  
+        self.player.sub_border_color = '#000000'
+        self.player.sub_border_size = 2
         
         self.player._set_property('osd-font', self.current_sub_font)
         self.player._set_property('osd-font-size', str(self.current_sub_size))
@@ -510,8 +515,7 @@ class CyberPlayer(QMainWindow):
 
     # --- MAIN THREAD TIMELINE ENGINE LOOP ---
     def update_timeline(self):
-        # UI handshaking checkpoint loop
-        if self.is_awaiting_resume and not self.slider.isSliderDown():
+        if self.is_awaiting_resume and not self.slider.is_user_dragging:
             try:
                 dur = self.player.duration
                 pos = self.player.time_pos
@@ -526,14 +530,20 @@ class CyberPlayer(QMainWindow):
 
         if self.is_awaiting_resume: return 
         
-        if not self.slider.isSliderDown(): 
+        if not self.slider.is_user_dragging: 
             try:
                 pos = self.player.time_pos
                 dur = self.player.duration
                 if pos is not None and dur is not None and dur > 0:
-                    if self.slider.maximum() != int(dur): self.slider.setRange(0, int(dur))
+                    # FIX: Scale range maximum by 100 to allocate 100 fractional steps inside every second
+                    scaled_max = int(dur * 100)
+                    scaled_pos = int(pos * 100)
+                    
+                    if self.slider.maximum() != scaled_max: 
+                        self.slider.setRange(0, scaled_max)
+                        
                     self.slider.blockSignals(True)
-                    self.slider.setValue(int(pos))
+                    self.slider.setValue(scaled_pos)
                     self.slider.blockSignals(False)
                     self.time_label.setText(f"{self.format_time(pos)} / {self.format_time(dur)}")
                     
@@ -559,34 +569,43 @@ class CyberPlayer(QMainWindow):
                 self.pyqt_sub_label.setText(formatted_text)
                 self.pyqt_sub_label.show()
 
-    # --- TIME OPERATIONS ---
     def skip_forward(self):
         if self.player.time_pos is not None: self.player.time_pos += 5.0
 
     def skip_backward(self):
         if self.player.time_pos is not None: self.player.time_pos = max(0.0, self.player.time_pos - 5.0)
 
-    def format_time(self, seconds):
-        if seconds is None: return "00:00:00"
-        s = int(seconds)
-        m, s = divmod(s, 60)
-        h, m = divmod(m, 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
+    # FIX: Refactored time formatter now renders live millisecond fractions (.00)
+    def format_time(self, total_seconds):
+        if total_seconds is None: return "00:00:00.00"
+        total_milliseconds = int(total_seconds * 100)
+        seconds, hundredths = divmod(total_milliseconds, 100)
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{hundredths:02d}"
 
-    def preview_time(self, value):
+    # FIX: Downscales high-resolution slider values by 100.0 to parse fluid timestamps
+    def preview_time(self, scaled_value):
         try:
             dur = self.player.duration
-            if dur: self.time_label.setText(f"{self.format_time(value)} / {self.format_time(dur)}")
+            if dur: 
+                live_seconds = scaled_value / 100.0
+                self.time_label.setText(f"{self.format_time(live_seconds)} / {self.format_time(dur)}")
         except:
             pass
 
+    # FIX: Downscales final release position to map precise float tracking properties onto MPV
     def apply_video_position(self):
         try:
-            if self.player.duration is not None: self.player.time_pos = float(self.slider.value())
+            if self.player.duration is not None: 
+                target_seconds = float(self.slider.value() / 100.0)
+                self.player.time_pos = target_seconds
+                if self.active_media_path:
+                    self.playback_positions[self.active_media_path] = target_seconds
+                    self.save_configuration_memory()
         except:
             pass
 
-    # --- MULTI-VAULT SUBTITLE & MEDIA LINKERS ---
     def load_media(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Select Media", "", "Media (*.mp4 *.mkv *.avi *.mp3 *.flac *.wav)")
         if filepath:
@@ -636,14 +655,11 @@ class CyberPlayer(QMainWindow):
             except:
                 pass
 
-    # --- FIXED PLAY FILE INITIALIZER (CRASH IMMUNE PIPELINE) ---
     def play_file(self, filepath):
-        # 1. Force the active sync clock loop to pause and stand down before switching handles
         self.is_initializing = True
         self.is_awaiting_resume = False
         self.pending_resume_seconds = 0.0
         
-        # 2. Extract current position parameters safely before dropping decoder instances
         if self.active_media_path and hasattr(self, 'player'):
             try:
                 pos = self.player.time_pos
@@ -654,15 +670,15 @@ class CyberPlayer(QMainWindow):
             
         self.active_media_path = filepath
         
-        # 3. Terminate current video pipeline thread instances completely to prevent list click collision crashes
         try:
             self.player.play(filepath)
             self.player.pause = False
             self.set_vector_icon(self.play_btn, SVG_PAUSE)
         except Exception as e:
-            print(f"Decoder reallocation fault bypassed: {e}")
+            print(f"Decoder re-allocation anomaly: {e}")
 
-        # 4. Pull auto-matched subtitle data mappings
+        self.update_sub_styles()
+
         if filepath in self.custom_subs_map:
             saved_sub_path = self.custom_subs_map[filepath]
             self.load_subtitle_from_path(saved_sub_path)
@@ -671,7 +687,6 @@ class CyberPlayer(QMainWindow):
             self.sub_status_label.setStyleSheet("color: #666;")
             self.pyqt_sub_label.hide()
 
-        # 5. FIXED: Safetynet check lowered down to > 0.5 seconds to track short video files seamlessly
         if filepath in self.playback_positions:
             saved_seconds = self.playback_positions[filepath]
             if saved_seconds > 0.5:
