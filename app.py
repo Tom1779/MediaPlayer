@@ -98,6 +98,9 @@ QPushButton:hover {
 #CloseBtn { border: none; color: #ff00ea; font-size: 18px; font-weight: bold; }
 #CloseBtn:hover { background: rgba(255, 0, 234, 0.2); color: #ffffff; }
 
+#MaximizeBtn { border: none; color: #00f3ff; font-size: 15px; font-weight: bold; }
+#MaximizeBtn:hover { background: rgba(0, 243, 255, 0.15); color: #ffffff; }
+
 #PlayBtn, #FullscreenBtn {
     border: 1px solid rgba(0, 243, 255, 0.2);
     padding: 4px;
@@ -212,8 +215,9 @@ class CyberPlayer(QMainWindow):
         self.active_media_path = None
         self.is_awaiting_resume = False 
         self.pending_resume_seconds = 0.0 
-        self.is_initializing = True  
-        
+        self.is_initializing = True
+        self.video_fs_window = None
+
         self.init_ui()
         
         # Initialize MPV Engine
@@ -315,17 +319,25 @@ class CyberPlayer(QMainWindow):
         title_text.setObjectName("TitleText")
         title_layout.addWidget(title_text)
         
+        title_layout.addStretch()
+
+        maximize_btn = QPushButton("❐")
+        maximize_btn.setObjectName("MaximizeBtn")
+        maximize_btn.setFixedSize(45, 35)
+        maximize_btn.setToolTip("Maximize App")
+        maximize_btn.clicked.connect(self.toggle_fullscreen)
+        title_layout.addWidget(maximize_btn)
+
         close_btn = QPushButton("✕")
         close_btn.setObjectName("CloseBtn")
         close_btn.setFixedSize(45, 35)
-        close_btn.clicked.connect(self.safely_handle_app_exit) 
-        title_layout.addStretch()
+        close_btn.clicked.connect(self.safely_handle_app_exit)
         title_layout.addWidget(close_btn)
         right_layout.addWidget(title_bar)
         
-        viewport_container = QWidget()
-        viewport_layout = QVBoxLayout(viewport_container)
-        viewport_container.setContentsMargins(0, 0, 0, 0)
+        self.viewport_container = QWidget()
+        viewport_layout = QVBoxLayout(self.viewport_container)
+        self.viewport_container.setContentsMargins(0, 0, 0, 0)
         viewport_layout.setSpacing(0)
         
         self.video_frame = QWidget()
@@ -343,10 +355,10 @@ class CyberPlayer(QMainWindow):
         viewport_layout.addWidget(self.video_frame)
         
         # --- FLOATING BOTTOM BAR DECK ---
-        bottom_bar = QWidget(viewport_container)
-        bottom_bar.setObjectName("BottomBar")
-        bottom_bar.setFixedHeight(85)
-        bottom_layout = QVBoxLayout(bottom_bar)
+        self.bottom_bar = QWidget(self.viewport_container)
+        self.bottom_bar.setObjectName("BottomBar")
+        self.bottom_bar.setFixedHeight(85)
+        bottom_layout = QVBoxLayout(self.bottom_bar)
         bottom_layout.setContentsMargins(20, 5, 20, 15)
         bottom_layout.setSpacing(8)
         
@@ -414,17 +426,18 @@ class CyberPlayer(QMainWindow):
         controls_layout.addWidget(sub_btn)
         
         controls_layout.addStretch()
-        
-        fullscreen_btn = QPushButton("⛶")
-        fullscreen_btn.setObjectName("FullscreenBtn")
-        fullscreen_btn.setFixedSize(32, 28)
-        fullscreen_btn.clicked.connect(self.toggle_fullscreen)
-        controls_layout.addWidget(fullscreen_btn)
+
+        video_fs_btn = QPushButton("⛶")
+        video_fs_btn.setObjectName("FullscreenBtn")
+        video_fs_btn.setFixedSize(45, 32)
+        video_fs_btn.setToolTip("Video Fullscreen")
+        video_fs_btn.clicked.connect(self.toggle_video_fullscreen)
+        controls_layout.addWidget(video_fs_btn)
         
         bottom_layout.addLayout(controls_layout)
-        viewport_layout.addWidget(bottom_bar)
+        viewport_layout.addWidget(self.bottom_bar)
         
-        right_layout.addWidget(viewport_container)
+        right_layout.addWidget(self.viewport_container)
         main_layout.addWidget(right_widget)
 
     def set_vector_icon(self, button, svg_data):
@@ -541,8 +554,9 @@ class CyberPlayer(QMainWindow):
         self.save_configuration_memory()
 
     def open_color_dialog(self):
-        self.timer.stop() 
-        dialog = QColorDialog(self)
+        self.timer.stop()
+        parent = self.video_fs_window if self.video_fs_window is not None else self
+        dialog = QColorDialog(parent)
         dialog.setCurrentColor(QColor(self.current_sub_color))
         dialog.setWindowTitle("CHOOSE SUBTITLE COLOR")
         
@@ -557,7 +571,8 @@ class CyberPlayer(QMainWindow):
 
     def open_font_dialog(self):
         self.timer.stop()
-        dialog = QFontDialog(self)
+        parent = self.video_fs_window if self.video_fs_window is not None else self
+        dialog = QFontDialog(parent)
         dialog.setCurrentFont(QFont(self.current_sub_font, self.current_sub_size))
         dialog.setWindowTitle("SELECT SUBTITLE FONT")
         
@@ -816,8 +831,9 @@ class CyberPlayer(QMainWindow):
             pass
         time_str = self.format_time(target_seconds)
         
+        parent = self.video_fs_window if self.video_fs_window is not None else self
         reply = QMessageBox.question(
-            self, 
+            parent,
             "SYS.MEMORY // DECK RESUME", 
             f"Welcome back. Playback bookmark found for last track session.\nResume from timestamp position {time_str}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -851,6 +867,67 @@ class CyberPlayer(QMainWindow):
     def toggle_fullscreen(self):
         if self.isFullScreen(): self.showNormal()
         else: self.showFullScreen()
+
+    def toggle_video_fullscreen(self):
+        if self.video_fs_window is not None:
+            QTimer.singleShot(0, self._exit_video_fullscreen)
+        else:
+            self._enter_video_fullscreen()
+
+    def _enter_video_fullscreen(self):
+        from PyQt6.QtGui import QShortcut
+
+        screen = QApplication.primaryScreen().geometry()
+
+        self.video_fs_window = QWidget(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.video_fs_window.setStyleSheet("background-color: #000000;")
+        self.video_fs_window.setGeometry(screen)
+
+        layout = QVBoxLayout(self.video_fs_window)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Reparent video_frame and bottom_bar into the fullscreen window
+        self.video_frame.setParent(self.video_fs_window)
+        self.bottom_bar.setParent(self.video_fs_window)
+        layout.addWidget(self.video_frame)
+        layout.addWidget(self.bottom_bar)
+
+        self.video_fs_window.show()
+        self.video_frame.show()
+        self.bottom_bar.show()
+        QApplication.processEvents()
+
+        try:
+            self.player.wid = str(int(self.video_frame.winId()))
+        except Exception:
+            pass
+
+        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.video_fs_window)
+        esc.activated.connect(self._exit_video_fullscreen)
+
+        self.video_fs_window.showFullScreen()
+
+    def _exit_video_fullscreen(self):
+        if self.video_fs_window is None:
+            return
+
+        vl = self.viewport_container.layout()
+        self.video_frame.setParent(self.viewport_container)
+        self.bottom_bar.setParent(self.viewport_container)
+        vl.insertWidget(0, self.video_frame)
+        vl.addWidget(self.bottom_bar)
+        self.video_frame.show()
+        self.bottom_bar.show()
+        QApplication.processEvents()
+
+        try:
+            self.player.wid = str(int(self.video_frame.winId()))
+        except Exception:
+            pass
+
+        self.video_fs_window.close()
+        self.video_fs_window = None
 
     def filter_files(self, text):
         search_query = text.lower()
