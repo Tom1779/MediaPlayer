@@ -1,6 +1,5 @@
 import sys
 import os
-import time
 import json
 
 # --- FREEZE-PROOF SYSTEM PATH ANCHOR ---
@@ -16,7 +15,7 @@ import mpv
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
                              QHBoxLayout, QWidget, QFileDialog, QListWidget, QLineEdit, 
                              QSlider, QLabel, QColorDialog, QFontDialog, QMessageBox) 
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal
 from PyQt6.QtWidgets import QGraphicsOpacityEffect
 from PyQt6.QtGui import QShortcut, QKeySequence, QIcon, QPixmap, QColor, QFont
 from PyQt6.QtSvg import QSvgRenderer
@@ -114,8 +113,7 @@ QSlider::handle:horizontal { background: #00f3ff; width: 10px; height: 10px; mar
 #VolumeSlider::sub-page:horizontal { background: #00f3ff; }
 #VolumeSlider::handle:horizontal { background: #ff00ea; }
 
-#TimeLabel, #SubStatusLabel, #VolumeLabel { color: #888; font-family: 'Consolas'; font-size: 12px; }
-#SubStatusLabel { color: #666; margin-left: 15px; }
+#TimeLabel, #VolumeLabel { color: #888; font-family: 'Consolas'; font-size: 12px; }
 #VolumeLabel { color: #00f3ff; font-weight: bold; margin-left: 10px; }
 
 QMessageBox { background-color: #0a0a0a; border: 1px solid #ff00ea; }
@@ -162,17 +160,14 @@ class ClickableSlider(QSlider):
         else:
             super().mouseReleaseEvent(event)
 
-class TimelineSlider(ClickableSlider):
-    pass
-
-class VolumeSlider(ClickableSlider):
-    pass
 
 class CyberPlayer(QMainWindow):
+    _file_loaded = pyqtSignal()
+    _sub_ready = pyqtSignal()  # emitted from file-loaded to apply pending sub on main thread
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CyberPlayer")
         self.resize(1280, 720)
+        self.setMinimumSize(900, 500)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setStyleSheet(STYLESHEET)
         
@@ -190,10 +185,14 @@ class CyberPlayer(QMainWindow):
         self.speed_steps = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
         self.speed_index = 3  # default 1.0x
         self.active_media_path = None
+        self._pending_sub = None  # sub action deferred until file-loaded
         self.is_awaiting_resume = False 
         self.pending_resume_seconds = 0.0 
         self.is_initializing = True
         self.video_fs_window = None
+        self._resize_edge = None
+        self._resize_start_pos = None
+        self._resize_start_geom = None
         self._controls_hide_timer = QTimer(self)
         self._controls_hide_timer.setSingleShot(True)
         self._controls_hide_timer.setInterval(5000)
@@ -203,7 +202,33 @@ class CyberPlayer(QMainWindow):
         self._controls_anim = None
 
         self.init_ui()
-        
+
+        # Lock time label width using explicit font construction — stylesheet may not be
+        # applied yet when measuring, so we build the font directly to get accurate metrics.
+        from PyQt6.QtGui import QFontMetrics, QFont
+        fm = QFontMetrics(QFont("Consolas", 12))
+        self.time_label.setFixedWidth(fm.horizontalAdvance("00:00:00 / 00:00:00") + 16)
+
+        # App-level event filter for edge resize (child widgets swallow mouse events otherwise)
+        from PyQt6.QtCore import QObject, QEvent
+        class _ResizeFilter(QObject):
+            def __init__(self_, win):
+                super().__init__(win)
+                self_._win = win
+            def eventFilter(self_, obj, event):
+                t = event.type()
+                if t == QEvent.Type.MouseMove:
+                    self_._win._handle_mouse_move(event)
+                    return False
+                if t == QEvent.Type.MouseButtonPress:
+                    return self_._win._handle_mouse_press(event)
+                if t == QEvent.Type.MouseButtonRelease:
+                    self_._win._handle_mouse_release(event)
+                    return False
+                return False
+        self._resize_filter = _ResizeFilter(self)
+        QApplication.instance().installEventFilter(self._resize_filter)
+
         # Initialize MPV Engine
         self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), force_window=True, keep_open='yes', volume_max=150.0)
         
@@ -212,18 +237,29 @@ class CyberPlayer(QMainWindow):
         except AttributeError:
             self.player._set_property('sub-use-osd', 'yes')
 
-        self.player._set_property('osd-font', 'Consolas')
-        self.player._set_property('osd-blur', '2')
-        self.player._set_property('osd-border-size', '3')
-        self.player._set_property('osd-margin-y', '45')
+        self.player['osd-font'] = 'Consolas'
+        self.player['osd-blur'] = 2.0
+        self.player['osd-border-size'] = 3.0
+        self.player['osd-margin-y'] = 45
+        self.player['sub-ass-override'] = 'yes'
         
-        # Re-apply subtitle styles once mpv's renderer is actually ready.
-        # 'file-loaded' fires after mpv has fully initialized the track,
-        # guaranteeing _set_property calls land correctly every time.
+        # Apply styles when track-list changes — fires after mpv has fully parsed
+        # the subtitle track, so guaranteed to run after the track is ready.
+        self._file_loaded.connect(self.update_sub_styles)
+        self._sub_ready.connect(self._apply_pending_sub)
+
+        def _on_track_list_change(name, value):
+            if value and any(t.get('type') == 'sub' for t in (value or [])):
+                self._file_loaded.emit()
+
+        self.player.observe_property('track-list', _on_track_list_change)
+        self._on_track_list_cb = _on_track_list_change
+
         @self.player.event_callback('file-loaded')
         def _on_file_loaded(_event):
-            QTimer.singleShot(0, self.update_sub_styles)
-        self._on_file_loaded_cb = _on_file_loaded  # keep reference alive
+            self._file_loaded.emit()
+            self._sub_ready.emit()
+        self._on_file_loaded_cb = _on_file_loaded
 
         last_played_media = self.load_configuration_memory()
         self.update_sub_styles() 
@@ -276,7 +312,8 @@ class CyberPlayer(QMainWindow):
         # --- LEFT SIDE PANEL ---
         side_panel = QWidget()
         side_panel.setObjectName("SidePanel")
-        side_panel.setFixedWidth(260)
+        side_panel.setMinimumWidth(160)
+        side_panel.setMaximumWidth(260)
         side_layout = QVBoxLayout(side_panel)
         side_layout.setContentsMargins(12, 12, 12, 12)
         side_layout.setSpacing(8)
@@ -287,19 +324,43 @@ class CyberPlayer(QMainWindow):
         self.search_bar.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         side_layout.addWidget(self.search_bar)
         
+        media_header = QHBoxLayout()
         lbl_media = QLabel("// MEDIA VAULT")
         lbl_media.setProperty("class", "PanelTitle")
-        side_layout.addWidget(lbl_media)
-        
+        media_header.addWidget(lbl_media)
+        media_header.addStretch()
+        load_media_btn = QPushButton("+ LOAD")
+        load_media_btn.setFixedHeight(22)
+        load_media_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        load_media_btn.clicked.connect(self.load_media)
+        media_header.addWidget(load_media_btn)
+        side_layout.addLayout(media_header)
+
         self.file_list = QListWidget()
+        self.file_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
         self.file_list.itemDoubleClicked.connect(self.play_from_list)
         side_layout.addWidget(self.file_list)
-        
+
+        subs_header = QHBoxLayout()
         lbl_subs = QLabel("// SUBTITLE VAULT")
         lbl_subs.setProperty("class", "PanelTitle")
-        side_layout.addWidget(lbl_subs)
-        
+        subs_header.addWidget(lbl_subs)
+        subs_header.addStretch()
+        clear_subs_btn = QPushButton("✕ OFF")
+        clear_subs_btn.setFixedHeight(22)
+        clear_subs_btn.setStyleSheet("font-size: 10px; padding: 2px 8px; color: #ff00ea; border-color: rgba(255, 0, 234, 0.4);")
+        clear_subs_btn.setToolTip("Disable subtitles for this video")
+        clear_subs_btn.clicked.connect(self.clear_subtitle)
+        subs_header.addWidget(clear_subs_btn)
+        load_subs_btn = QPushButton("+ LOAD")
+        load_subs_btn.setFixedHeight(22)
+        load_subs_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        load_subs_btn.clicked.connect(self.load_subtitle)
+        subs_header.addWidget(load_subs_btn)
+        side_layout.addLayout(subs_header)
+
         self.sub_list = QListWidget()
+        self.sub_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
         self.sub_list.itemDoubleClicked.connect(self.play_sub_from_list)
         side_layout.addWidget(self.sub_list)
         
@@ -307,6 +368,7 @@ class CyberPlayer(QMainWindow):
         
         # --- RIGHT VIEWER ---
         right_widget = QWidget()
+        right_widget.setStyleSheet("background-color: #000000;")
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
@@ -346,6 +408,7 @@ class CyberPlayer(QMainWindow):
         right_layout.addWidget(title_bar)
         
         self.viewport_container = QWidget()
+        self.viewport_container.setStyleSheet("background-color: #000000;")
         viewport_layout = QVBoxLayout(self.viewport_container)
         self.viewport_container.setContentsMargins(0, 0, 0, 0)
         viewport_layout.setSpacing(0)
@@ -362,7 +425,7 @@ class CyberPlayer(QMainWindow):
         self.pyqt_sub_label.hide() 
         
         video_overlay_layout.addWidget(self.pyqt_sub_label, alignment=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
-        viewport_layout.addWidget(self.video_frame)
+        viewport_layout.addWidget(self.video_frame, stretch=1)
         
         # --- FLOATING BOTTOM BAR DECK ---
         self.bottom_bar = QWidget(self.viewport_container)
@@ -372,7 +435,7 @@ class CyberPlayer(QMainWindow):
         bottom_layout.setContentsMargins(20, 5, 20, 15)
         bottom_layout.setSpacing(8)
         
-        self.slider = TimelineSlider(Qt.Orientation.Horizontal)
+        self.slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0) 
         self.slider.sliderMoved.connect(self.preview_time)
         self.slider.sliderReleased.connect(self.apply_video_position)
@@ -380,61 +443,50 @@ class CyberPlayer(QMainWindow):
         
         controls_layout = QHBoxLayout()
         controls_layout.setContentsMargins(0, 0, 0, 0)
-        
+        controls_layout.setSpacing(6)
+
         self.play_btn = QPushButton()
         self.play_btn.setObjectName("PlayBtn")
         self.play_btn.setFixedSize(32, 28)
         self.set_vector_icon(self.play_btn, SVG_PLAY)
         self.play_btn.clicked.connect(self.toggle_play)
         controls_layout.addWidget(self.play_btn)
-        
-        self.time_label = QLabel("00:00:00.00 / 00:00:00.00")
+
+        self.time_label = QLabel("00:00:00 / 00:00:00")
         self.time_label.setObjectName("TimeLabel")
         controls_layout.addWidget(self.time_label)
-        
-        self.volume_slider = VolumeSlider(Qt.Orientation.Horizontal)
+
+        self.volume_slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setObjectName("VolumeSlider")
-        self.volume_slider.setRange(0, 100) 
+        self.volume_slider.setRange(0, 100)
         self.volume_slider.setFixedWidth(80)
         self.volume_slider.sliderMoved.connect(self.adjust_system_volume)
         controls_layout.addWidget(self.volume_slider)
-        
+
         self.volume_label = QLabel("VOL: 100%")
         self.volume_label.setObjectName("VolumeLabel")
         controls_layout.addWidget(self.volume_label)
-        
-        self.sub_status_label = QLabel("SUBTITLE: NONE")
-        self.sub_status_label.setObjectName("SubStatusLabel")
-        controls_layout.addWidget(self.sub_status_label)
-        
-        controls_layout.addSpacing(20)
-        
+
+        controls_layout.addStretch(1)
+
         btn_sub_dec = QPushButton("A-")
         btn_sub_dec.clicked.connect(lambda: self.adjust_sub_size(-4))
         controls_layout.addWidget(btn_sub_dec)
-        
+
         btn_sub_inc = QPushButton("A+")
         btn_sub_inc.clicked.connect(lambda: self.adjust_sub_size(4))
         controls_layout.addWidget(btn_sub_inc)
-        
+
         btn_sub_color = QPushButton("COLOR")
         btn_sub_color.clicked.connect(self.open_color_dialog)
         controls_layout.addWidget(btn_sub_color)
-        
+
         btn_sub_font = QPushButton("FONT")
         btn_sub_font.clicked.connect(self.open_font_dialog)
         controls_layout.addWidget(btn_sub_font)
-        
-        controls_layout.addSpacing(20)
-        
-        load_btn = QPushButton("LOAD MEDIA")
-        load_btn.clicked.connect(self.load_media)
-        controls_layout.addWidget(load_btn)
-        
-        sub_btn = QPushButton("LOAD SUBTITLE")
-        sub_btn.clicked.connect(self.load_subtitle)
-        controls_layout.addWidget(sub_btn)
-        
+
+        controls_layout.addStretch(1)
+
         speed_label = QLabel("SPD:")
         speed_label.setObjectName("TimeLabel")
         controls_layout.addWidget(speed_label)
@@ -445,7 +497,7 @@ class CyberPlayer(QMainWindow):
         self.speed_btn.clicked.connect(self.show_speed_menu)
         controls_layout.addWidget(self.speed_btn)
 
-        controls_layout.addStretch()
+        controls_layout.addStretch(1)
 
         video_fs_btn = QPushButton("⛶")
         video_fs_btn.setObjectName("FullscreenBtn")
@@ -487,7 +539,10 @@ class CyberPlayer(QMainWindow):
             self.playback_positions = {k.lower().replace('\\', '/'): v for k, v in raw_positions.items()}
             
             raw_subs_map = memory.get("custom_subs_map", {})
-            self.custom_subs_map = {k.lower().replace('\\', '/'): v.lower().replace('\\', '/') for k, v in raw_subs_map.items()}
+            self.custom_subs_map = {
+                k.lower().replace('\\', '/'): (v if v == "none" else v.lower().replace('\\', '/'))
+                for k, v in raw_subs_map.items()
+            }
             
             for path in memory.get("media_files_playlist", []):
                 norm_path = path.lower().replace('\\', '/')
@@ -530,7 +585,10 @@ class CyberPlayer(QMainWindow):
         disk_positions = {k.lower().replace('\\', '/'): v for k, v in on_disk_memory.get("playback_positions", {}).items()}
         disk_positions.update(self.playback_positions)
         
-        disk_subs_map = {k.lower().replace('\\', '/'): v.lower().replace('\\', '/') for k, v in on_disk_memory.get("custom_subs_map", {}).items()}
+        disk_subs_map = {
+            k.lower().replace('\\', '/'): (v if v == "none" else v.lower().replace('\\', '/'))
+            for k, v in on_disk_memory.get("custom_subs_map", {}).items()
+        }
         disk_subs_map.update(self.custom_subs_map)
 
         memory_payload = {
@@ -636,23 +694,56 @@ class CyberPlayer(QMainWindow):
         r, g, b = clean_hex[0:2], clean_hex[2:4], clean_hex[4:6]
         return f"00{b}{g}{r}".upper()
 
-    def update_sub_styles(self):
+    def _log_sub_state(self, label):
         try:
-            self.player._set_property('sub-font', self.current_sub_font)
-            self.player._set_property('sub-font-size', str(self.current_sub_size))
-            self.player._set_property('sub-color', self.current_sub_color)
-            self.player._set_property('sub-border-color', '#000000')
-            self.player._set_property('sub-border-size', '2')
-            
-            self.player._set_property('osd-font', self.current_sub_font)
-            self.player._set_property('osd-font-size', str(self.current_sub_size))
-            
-            mpv_ready_bgr_hex = self.convert_rgb_to_mpv_hex(self.current_sub_color)
-            self.player._set_property('osd-color', f"#{mpv_ready_bgr_hex}")
-            self.player._set_property('osd-border-color', '#000000')
-            self.player._set_property('osd-border-size', '1') 
+            props = {
+                'sid':       self.player['sid'],
+                'sub-auto':  self.player['sub-auto'],
+                'sub-text':  (self.player['sub-text'] or '')[:40],
+            }
+            print(f"[SUB DEBUG] {label}: sid={props['sid']!r} sub-auto={props['sub-auto']!r} text={props['sub-text']!r}")
         except Exception as e:
-            print(f"Sub style error: {e}")
+            print(f"[SUB DEBUG] {label}: error — {e}")
+
+    def _verify_sub_styles(self):
+        try:
+            color = self._rgb_to_mpv_color(self.current_sub_color)
+            if (self.player['osd-font'] != self.current_sub_font or
+                self.player['osd-font-size'] != int(self.current_sub_size) or
+                self.player['osd-color'] != color):
+                print(f"[SUB DEBUG] verify triggered re-apply")
+                self.update_sub_styles()
+        except Exception as e:
+            print(f"[SUB DEBUG] verify error: {e}")
+
+    def _rgb_to_mpv_color(self, hex_color):
+        """Convert #RRGGBB to mpv's #AARRGGBB format (AA=FF is fully opaque)."""
+        h = hex_color.lstrip('#')
+        if len(h) == 6:
+            return f'#FF{h.upper()}'
+        return hex_color
+
+    def update_sub_styles(self):
+        color = self._rgb_to_mpv_color(self.current_sub_color)
+        for prop, val in [
+            ('sub-ass-override', 'yes'),
+            ('sub-font',         self.current_sub_font),
+            ('sub-font-size',    int(self.current_sub_size)),
+            ('sub-color',        color),
+            ('sub-border-color', '#FF000000'),
+            ('sub-border-size',  2.0),
+            ('sub-shadow-color', '#FF000000'),
+            ('sub-shadow-offset',1.0),
+            ('osd-font',         self.current_sub_font),
+            ('osd-font-size',    int(self.current_sub_size)),
+            ('osd-color',        color),
+            ('osd-border-color', '#FF000000'),
+            ('osd-border-size',  1.0),
+        ]:
+            try:
+                self.player[prop] = val
+            except Exception as e:
+                print(f"[SUB] failed to set {prop}={val!r}: {e}")
         
         if self.last_known_text:
             self.refresh_pyqt_label_styling()
@@ -691,16 +782,21 @@ class CyberPlayer(QMainWindow):
                 pos = self.player.time_pos
                 dur = self.player.duration
                 if pos is not None and dur is not None and dur > 0:
-                    scaled_max = int(dur * 100)
-                    scaled_pos = int(pos * 100)
+                    import math
+                    scaled_max = math.ceil(dur * 100)
+                    # Snap to end if within 0.5s — mpv's last decoded frame
+                    # is always slightly behind the container duration
+                    at_end = (dur - pos) < 0.05
+                    display_pos = dur if at_end else pos
+                    scaled_pos = scaled_max if at_end else int(pos * 100)
                     
-                    if self.slider.maximum() != scaled_max: 
+                    if self.slider.maximum() != scaled_max:
                         self.slider.setRange(0, scaled_max)
                         
                     self.slider.blockSignals(True)
                     self.slider.setValue(scaled_pos)
                     self.slider.blockSignals(False)
-                    self.time_label.setText(f"{self.format_time(pos)} / {self.format_time(dur)}")
+                    self.time_label.setText(f"{self.format_time(display_pos)} / {self.format_time(dur)}")
                     
                     if self.active_media_path and not self.is_initializing:
                         self.playback_positions[self.active_media_path] = pos
@@ -708,21 +804,6 @@ class CyberPlayer(QMainWindow):
             except:
                 pass
 
-        try:
-            raw_text = self.player.get_property('sub-text')
-            subtitle_text = str(raw_text).strip() if raw_text else ""
-        except:
-            subtitle_text = ""
-
-        if subtitle_text != self.last_known_text:
-            self.last_known_text = subtitle_text
-            if not subtitle_text:
-                self.pyqt_sub_label.hide()
-            else:
-                formatted_text = subtitle_text.replace('\r\n', '<br>').replace('\n', '<br>')
-                self.refresh_pyqt_label_styling()
-                self.pyqt_sub_label.setText(formatted_text)
-                self.pyqt_sub_label.show()
 
     def skip_forward(self):
         if self.player.time_pos is not None: self.player.time_pos += 5.0
@@ -758,12 +839,11 @@ class CyberPlayer(QMainWindow):
         self.speed_btn.setText(f"{speed}x")
 
     def format_time(self, total_seconds):
-        if total_seconds is None: return "00:00:00.00"
-        total_milliseconds = int(total_seconds * 100)
-        seconds, hundredths = divmod(total_milliseconds, 100)
-        minutes, seconds = divmod(seconds, 60)
+        if total_seconds is None: return "00:00:00"
+        total_seconds = int(total_seconds)
+        minutes, seconds = divmod(total_seconds, 60)
         hours, minutes = divmod(minutes, 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{hundredths:02d}"
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def preview_time(self, scaled_value):
         try:
@@ -835,13 +915,26 @@ class CyberPlayer(QMainWindow):
             try:
                 self.player.sub_add(norm_path)
                 filename = os.path.basename(norm_path)
-                self.sub_status_label.setText(f"SUBTITLE: {filename.upper()}")
-                self.sub_status_label.setStyleSheet("color: #ff00ea; font-weight: bold;")
+                # Highlight active subtitle in vault list
+                self._highlight_active_sub(norm_path)
                 if self.active_media_path:
                     self.custom_subs_map[self.active_media_path] = norm_path
                     self.save_configuration_memory()
             except Exception as e:
                 print(f"Subtitle load error: {e}")
+
+    def clear_subtitle(self):
+        """Disable subtitles for the current video and persist that choice."""
+        try:
+            self.player._set_property('sid', 'no')
+        except Exception as e:
+            print(f"Subtitle clear error: {e}")
+        self._highlight_active_sub(None)
+        self.last_known_text = ""
+        self.pyqt_sub_label.hide()
+        if self.active_media_path:
+            self.custom_subs_map[self.active_media_path] = "none"
+            self.save_configuration_memory()
 
     def play_file(self, filepath):
         self.is_initializing = True
@@ -865,6 +958,7 @@ class CyberPlayer(QMainWindow):
                 print(f"Position save error: {e}")
             
         self.active_media_path = norm_path
+        self._highlight_active_media(norm_path)
         
         try:
             self.player.play(norm_path)
@@ -877,11 +971,14 @@ class CyberPlayer(QMainWindow):
 
         if norm_path in self.custom_subs_map:
             saved_sub_path = self.custom_subs_map[norm_path]
-            self.load_subtitle_from_path(saved_sub_path)
+            if saved_sub_path == "none":
+                self._pending_sub = "none"
+            else:
+                self._pending_sub = saved_sub_path
         else:
-            self.sub_status_label.setText("SUBTITLE: NONE")
-            self.sub_status_label.setStyleSheet("color: #666;")
-            self.pyqt_sub_label.hide()
+            self._pending_sub = "auto"
+        self._highlight_active_sub(None)
+        self.pyqt_sub_label.hide()
 
         # Check if the database lookup position is validly past 0.5s
         if target_timestamp > 0.5:
@@ -892,6 +989,32 @@ class CyberPlayer(QMainWindow):
 
         self.handle_visual_frame_adjustments(norm_path)
         self.save_configuration_memory()
+
+    def _apply_pending_sub(self):
+        """Called on main thread via signal after file-loaded — safe to send sub_add now."""
+        action = self._pending_sub
+        self._pending_sub = None
+        if action is None:
+            return
+        if action == "none":
+            try:
+                self.player['sub-auto'] = 'no'
+                self.player['sid'] = 'no'
+            except Exception:
+                pass
+            self._highlight_active_sub(None)
+        elif action == "auto":
+            try:
+                self.player['sub-auto'] = 'fuzzy'
+            except Exception:
+                pass
+            self._highlight_active_sub(None)
+        else:
+            try:
+                self.player['sub-auto'] = 'fuzzy'
+            except Exception:
+                pass
+            self.load_subtitle_from_path(action)
 
     def handle_visual_frame_adjustments(self, filepath):
         _, ext = os.path.splitext(filepath.lower())
@@ -932,9 +1055,25 @@ class CyberPlayer(QMainWindow):
         self.is_awaiting_resume = False 
         self.is_initializing = False 
 
+    def _is_at_end(self):
+        """Returns True if playback has reached the end of the file."""
+        try:
+            pos = self.player.time_pos
+            dur = self.player.duration
+            if pos is None or dur is None or dur == 0:
+                return False
+            return (dur - pos) < 0.05
+        except:
+            return False
+
     def toggle_play(self):
         try:
-            if not self.player.pause:
+            if self._is_at_end():
+                # Restart from beginning
+                self.player.time_pos = 0.0
+                self.player.pause = False
+                self.set_vector_icon(self.play_btn, SVG_PAUSE)
+            elif not self.player.pause:
                 self.player.pause = True
                 self.set_vector_icon(self.play_btn, SVG_PLAY)
             else:
@@ -1070,10 +1209,13 @@ class CyberPlayer(QMainWindow):
         self.bottom_bar.show()
         QApplication.processEvents()
 
-        try:
-            self.player.wid = str(int(self.video_frame.winId()))
-        except Exception:
-            pass
+        def _rebind_wid():
+            try:
+                self.player.wid = str(int(self.video_frame.winId()))
+            except Exception:
+                pass
+
+        QTimer.singleShot(50, _rebind_wid)
 
         # Clean up auto-hide and fullscreen-specific event overrides
         self._controls_hide_timer.stop()
@@ -1095,6 +1237,38 @@ class CyberPlayer(QMainWindow):
         self.video_fs_window.close()
         self.video_fs_window = None
 
+    def _highlight_active_media(self, active_path):
+        """Bold and colour the active media entry in the vault; reset all others."""
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            stored = item.data(Qt.ItemDataRole.UserRole)
+            if active_path and stored == active_path:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setForeground(QColor("#ff00ea"))
+            else:
+                font = item.font()
+                font.setBold(False)
+                item.setFont(font)
+                item.setForeground(QColor("#888888"))
+
+    def _highlight_active_sub(self, active_path):
+        """Bold and colour the active subtitle entry in the vault; reset all others."""
+        for i in range(self.sub_list.count()):
+            item = self.sub_list.item(i)
+            stored = item.data(Qt.ItemDataRole.UserRole)
+            if active_path and stored == active_path:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setForeground(QColor("#ff00ea"))
+            else:
+                font = item.font()
+                font.setBold(False)
+                item.setFont(font)
+                item.setForeground(QColor("#888888"))
+
     def filter_files(self, text):
         search_query = text.lower()
         for i in range(self.file_list.count()):
@@ -1104,23 +1278,88 @@ class CyberPlayer(QMainWindow):
             item = self.sub_list.item(i)
             item.setHidden(search_query not in item.text().lower())
 
-    def mousePressEvent(self, event):
+    def _get_resize_edge(self, pos):
+        m = 6
+        x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
+        left, right, top, bottom = x < m, x > w - m, y < m, y > h - m
+        if top and left:   return 'tl'
+        if top and right:  return 'tr'
+        if bottom and left: return 'bl'
+        if bottom and right: return 'br'
+        if top:    return 't'
+        if bottom: return 'b'
+        if left:   return 'l'
+        if right:  return 'r'
+        return None
+
+    def _edge_cursor(self, edge):
+        return {
+            'tl': Qt.CursorShape.SizeFDiagCursor, 'br': Qt.CursorShape.SizeFDiagCursor,
+            'tr': Qt.CursorShape.SizeBDiagCursor, 'bl': Qt.CursorShape.SizeBDiagCursor,
+            't':  Qt.CursorShape.SizeVerCursor,   'b':  Qt.CursorShape.SizeVerCursor,
+            'l':  Qt.CursorShape.SizeHorCursor,   'r':  Qt.CursorShape.SizeHorCursor,
+        }.get(edge, Qt.CursorShape.ArrowCursor)
+
+    def _handle_mouse_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self.isFullScreen():
-            # Only start drag if click is within the title bar
-            title_bar_rect = self.title_bar.rect().translated(self.title_bar.mapTo(self, self.title_bar.rect().topLeft()))
-            if title_bar_rect.contains(event.position().toPoint()):
-                self.oldPos = event.globalPosition().toPoint()
-            else:
+            # Ignore events that belong to a different top-level window (e.g. video_fs_window)
+            if self.video_fs_window is not None:
+                return False
+            pos = self.mapFromGlobal(event.globalPosition().toPoint())
+            edge = self._get_resize_edge(pos)
+            if edge:
+                self._resize_edge = edge
+                self._resize_start_pos = event.globalPosition().toPoint()
+                self._resize_start_geom = self.geometry()
                 self.oldPos = None
+                return True
+            else:
+                self._resize_edge = None
+                title_bar_rect = self.title_bar.rect().translated(
+                    self.title_bar.mapTo(self, self.title_bar.rect().topLeft()))
+                self.oldPos = event.globalPosition().toPoint() if title_bar_rect.contains(pos) else None
+        return False
 
-    def mouseMoveEvent(self, event):
-        if getattr(self, 'oldPos', None) is not None and not self.isFullScreen():
-            delta = event.globalPosition().toPoint() - self.oldPos
+    def _handle_mouse_move(self, event):
+        if self.isFullScreen():
+            return
+        if self.video_fs_window is not None:
+            return
+        pos = self.mapFromGlobal(event.globalPosition().toPoint())
+        gpos = event.globalPosition().toPoint()
+        if self._resize_edge and self._resize_start_pos and self._resize_start_geom:
+            dx = gpos.x() - self._resize_start_pos.x()
+            dy = gpos.y() - self._resize_start_pos.y()
+            g = self._resize_start_geom
+            x, y, w, h = g.x(), g.y(), g.width(), g.height()
+            minw, minh = self.minimumWidth(), self.minimumHeight()
+            e = self._resize_edge
+            if 'r' in e: w = max(minw, w + dx)
+            if 'b' in e: h = max(minh, h + dy)
+            if 'l' in e:
+                new_w = max(minw, w - dx)
+                x = x + (w - new_w)
+                w = new_w
+            if 't' in e:
+                new_h = max(minh, h - dy)
+                y = y + (h - new_h)
+                h = new_h
+            self.setGeometry(x, y, w, h)
+        elif getattr(self, 'oldPos', None) is not None:
+            delta = gpos - self.oldPos
             self.move(self.x() + delta.x(), self.y() + delta.y())
-            self.oldPos = event.globalPosition().toPoint()
+            self.oldPos = gpos
+        else:
+            edge = self._get_resize_edge(pos)
+            self.setCursor(self._edge_cursor(edge) if edge else Qt.CursorShape.ArrowCursor)
 
-    def mouseReleaseEvent(self, event):
+    def _handle_mouse_release(self, event):
+        self._resize_edge = None
+        self._resize_start_pos = None
+        self._resize_start_geom = None
         self.oldPos = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
 
 # --- WINDOWS BOOTSTRAP INTERCEPTOR ---
 if __name__ == '__main__':
