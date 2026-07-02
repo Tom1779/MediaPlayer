@@ -230,27 +230,46 @@ class CyberPlayer(QMainWindow):
         QApplication.instance().installEventFilter(self._resize_filter)
 
         # Initialize MPV Engine
-        self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), force_window=True, keep_open='yes', volume_max=150.0)
+        _empty_config_dir = os.path.join(exe_dir, 'mpv_config')
+        os.makedirs(_empty_config_dir, exist_ok=True)
+        self.player = mpv.MPV(
+            wid=str(int(self.video_frame.winId())),
+            force_window=True,
+            keep_open='yes',
+            volume_max=150.0,
+            config_dir=_empty_config_dir,
+            vo='gpu',
+            sub_ass_override='force',
+            sub_ass_force_style='ScaledBorderAndShadow=yes',
+            sub_font='Consolas',
+            sub_font_size=36,
+            sub_color='#00f3ff',
+            sub_border_color='#000000',
+            sub_border_size=2,
+            sub_shadow_color='#000000',
+            sub_shadow_offset=1,
+            osd_font='Consolas',
+            osd_blur=2,
+            osd_border_size=3,
+            osd_margin_y=45,
+        )
         
         try:
             self.player.sub_use_osd = True
         except AttributeError:
             self.player._set_property('sub-use-osd', 'yes')
 
-        self.player['osd-font'] = 'Consolas'
-        self.player['osd-blur'] = 2.0
-        self.player['osd-border-size'] = 3.0
-        self.player['osd-margin-y'] = 45
-        self.player['sub-ass-override'] = 'yes'
+        print(f"[MPV] version={self.player.mpv_version!r} libmpv={self.player.mpv_version!r}")
         
-        # Apply styles when track-list changes — fires after mpv has fully parsed
-        # the subtitle track, so guaranteed to run after the track is ready.
         self._file_loaded.connect(self.update_sub_styles)
+        self._file_loaded.connect(lambda: print(f"[FL] file-loaded fired, sub-font={self.player['sub-font']!r} sub-color={self.player['sub-color']!r} sub-border-size={self.player['sub-border-size']!r}"))
         self._sub_ready.connect(self._apply_pending_sub)
+        self._sub_ready.connect(self.update_sub_styles)
+        self._sub_ready.connect(lambda: print(f"[SR] sub-ready fired, sub-font={self.player['sub-font']!r} sub-color={self.player['sub-color']!r} sub-border-size={self.player['sub-border-size']!r} sid={self.player['sid']!r}"))
 
         def _on_track_list_change(name, value):
             if value and any(t.get('type') == 'sub' for t in (value or [])):
-                self._file_loaded.emit()
+                self._sub_ready.emit()
 
         self.player.observe_property('track-list', _on_track_list_change)
         self._on_track_list_cb = _on_track_list_change
@@ -258,7 +277,6 @@ class CyberPlayer(QMainWindow):
         @self.player.event_callback('file-loaded')
         def _on_file_loaded(_event):
             self._file_loaded.emit()
-            self._sub_ready.emit()
         self._on_file_loaded_cb = _on_file_loaded
 
         last_played_media = self.load_configuration_memory()
@@ -298,7 +316,7 @@ class CyberPlayer(QMainWindow):
         if len(sys.argv) > 1:
             self.is_initializing = False
         elif last_played_media and os.path.exists(last_played_media):
-            QTimer.singleShot(200, lambda: self.play_file(last_played_media))
+            QTimer.singleShot(300, lambda: self.play_file(last_played_media))
         else:
             self.is_initializing = False
         
@@ -694,56 +712,42 @@ class CyberPlayer(QMainWindow):
         r, g, b = clean_hex[0:2], clean_hex[2:4], clean_hex[4:6]
         return f"00{b}{g}{r}".upper()
 
-    def _log_sub_state(self, label):
-        try:
-            props = {
-                'sid':       self.player['sid'],
-                'sub-auto':  self.player['sub-auto'],
-                'sub-text':  (self.player['sub-text'] or '')[:40],
-            }
-            print(f"[SUB DEBUG] {label}: sid={props['sid']!r} sub-auto={props['sub-auto']!r} text={props['sub-text']!r}")
-        except Exception as e:
-            print(f"[SUB DEBUG] {label}: error — {e}")
-
     def _verify_sub_styles(self):
         try:
             color = self._rgb_to_mpv_color(self.current_sub_color)
             if (self.player['osd-font'] != self.current_sub_font or
                 self.player['osd-font-size'] != int(self.current_sub_size) or
                 self.player['osd-color'] != color):
-                print(f"[SUB DEBUG] verify triggered re-apply")
                 self.update_sub_styles()
-        except Exception as e:
-            print(f"[SUB DEBUG] verify error: {e}")
+        except Exception:
+            pass
 
     def _rgb_to_mpv_color(self, hex_color):
-        """Convert #RRGGBB to mpv's #AARRGGBB format (AA=FF is fully opaque)."""
-        h = hex_color.lstrip('#')
-        if len(h) == 6:
-            return f'#FF{h.upper()}'
+        """Return color as-is — mpv sub-color accepts plain #RRGGBB."""
         return hex_color
 
     def update_sub_styles(self):
         color = self._rgb_to_mpv_color(self.current_sub_color)
         for prop, val in [
-            ('sub-ass-override', 'yes'),
-            ('sub-font',         self.current_sub_font),
+            ('sub-ass-override',    'force'),
+            ('sub-ass-force-style', 'ScaledBorderAndShadow=yes'),
+            ('sub-font',            self.current_sub_font),
             ('sub-font-size',    int(self.current_sub_size)),
             ('sub-color',        color),
-            ('sub-border-color', '#FF000000'),
+            ('sub-border-color', '#000000'),
             ('sub-border-size',  2.0),
-            ('sub-shadow-color', '#FF000000'),
+            ('sub-shadow-color', '#000000'),
             ('sub-shadow-offset',1.0),
             ('osd-font',         self.current_sub_font),
             ('osd-font-size',    int(self.current_sub_size)),
             ('osd-color',        color),
-            ('osd-border-color', '#FF000000'),
+            ('osd-border-color', '#000000'),
             ('osd-border-size',  1.0),
         ]:
             try:
                 self.player[prop] = val
             except Exception as e:
-                print(f"[SUB] failed to set {prop}={val!r}: {e}")
+                print(f"Sub style error {prop}: {e}")
         
         if self.last_known_text:
             self.refresh_pyqt_label_styling()
@@ -862,7 +866,7 @@ class CyberPlayer(QMainWindow):
                 if self.active_media_path:
                     self.playback_positions[self.active_media_path] = target_seconds
                     self.save_configuration_memory()
-        except:
+        except Exception:
             pass
 
     def load_media(self):
@@ -914,14 +918,14 @@ class CyberPlayer(QMainWindow):
         if os.path.exists(norm_path):
             try:
                 self.player.sub_add(norm_path)
-                filename = os.path.basename(norm_path)
-                # Highlight active subtitle in vault list
                 self._highlight_active_sub(norm_path)
                 if self.active_media_path:
                     self.custom_subs_map[self.active_media_path] = norm_path
                     self.save_configuration_memory()
             except Exception as e:
                 print(f"Subtitle load error: {e}")
+        else:
+            print(f"Subtitle file not found: {norm_path}")
 
     def clear_subtitle(self):
         """Disable subtitles for the current video and persist that choice."""
@@ -959,43 +963,47 @@ class CyberPlayer(QMainWindow):
             
         self.active_media_path = norm_path
         self._highlight_active_media(norm_path)
-        
+
+        # Determine subtitle to load
+        if norm_path in self.custom_subs_map:
+            saved_sub_path = self.custom_subs_map[norm_path]
+        else:
+            saved_sub_path = "auto"
+
         try:
-            self.player.play(norm_path)
+            if saved_sub_path == "none":
+                self.player.loadfile(norm_path, 'replace', sid='no', sub_auto='no')
+            elif saved_sub_path == "auto":
+                self.player.loadfile(norm_path, 'replace', sub_auto='fuzzy')
+            else:
+                self.player.loadfile(norm_path, 'replace', sub_file=saved_sub_path)
             self.player.pause = False
             self.set_vector_icon(self.play_btn, SVG_PAUSE)
         except Exception as e:
             print(f"Decoder re-allocation anomaly: {e}")
 
-        self.update_sub_styles()
-
-        if norm_path in self.custom_subs_map:
-            saved_sub_path = self.custom_subs_map[norm_path]
-            if saved_sub_path == "none":
-                self._pending_sub = "none"
-            else:
-                self._pending_sub = saved_sub_path
-        else:
-            self._pending_sub = "auto"
-        self._highlight_active_sub(None)
+        self._pending_sub = None  # no longer needed
+        self._highlight_active_sub(None if saved_sub_path in ("none", "auto") else saved_sub_path)
         self.pyqt_sub_label.hide()
+        self.update_sub_styles()
 
         # Check if the database lookup position is validly past 0.5s
         if target_timestamp > 0.5:
             self.pending_resume_seconds = target_timestamp
             self.is_awaiting_resume = True
         else:
-            self.is_initializing = False 
+            self.is_initializing = False
 
         self.handle_visual_frame_adjustments(norm_path)
         self.save_configuration_memory()
 
     def _apply_pending_sub(self):
-        """Called on main thread via signal after file-loaded — safe to send sub_add now."""
+        """Called after file-loaded — only used for manual sub selections now.
+        Initial sub loading is handled atomically via loadfile options."""
         action = self._pending_sub
-        self._pending_sub = None
         if action is None:
             return
+        self._pending_sub = None
         if action == "none":
             try:
                 self.player['sub-auto'] = 'no'
