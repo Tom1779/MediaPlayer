@@ -438,12 +438,12 @@ class CyberPlayer(QMainWindow):
         self.video_frame.setStyleSheet("background-color: #000000;")
         
         video_overlay_layout = QVBoxLayout(self.video_frame)
-        video_overlay_layout.addStretch() 
-        
+        video_overlay_layout.addStretch()
+
         self.pyqt_sub_label = QLabel("")
         self.pyqt_sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pyqt_sub_label.setWordWrap(True)
-        self.pyqt_sub_label.hide() 
+        self.pyqt_sub_label.hide()
         
         video_overlay_layout.addWidget(self.pyqt_sub_label, alignment=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
         viewport_layout.addWidget(self.video_frame, stretch=1)
@@ -451,6 +451,24 @@ class CyberPlayer(QMainWindow):
         # --- FLOATING BOTTOM BAR DECK ---
         self.bottom_bar = QWidget(self.viewport_container)
         self.bottom_bar.setObjectName("BottomBar")
+
+        # Pause/play flash overlay — floats over viewport_container, above mpv's render surface
+        self.pause_overlay = QLabel(self.viewport_container)
+        self.pause_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pause_overlay.setStyleSheet(
+            "color: rgba(255, 255, 255, 180); font-size: 72px; background: transparent; border: none; font-weight: bold;"
+        )
+        self.pause_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.pause_overlay.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.pause_overlay.hide()
+
+        # Override viewport_container resize to reposition overlay
+        def _vc_resize(event):
+            type(self.viewport_container).resizeEvent(self.viewport_container, event)
+            self._reposition_pause_overlay()
+            if self.pause_overlay.isVisible():
+                self.pause_overlay.raise_()
+        self.viewport_container.resizeEvent = _vc_resize
         self.bottom_bar.setFixedHeight(85)
         bottom_layout = QVBoxLayout(self.bottom_bar)
         bottom_layout.setContentsMargins(20, 5, 20, 15)
@@ -475,6 +493,7 @@ class CyberPlayer(QMainWindow):
 
         self.time_label = QLabel("00:00:00 / 00:00:00")
         self.time_label.setObjectName("TimeLabel")
+        self.time_label.setToolTip("0.000s / 0.000s")
         controls_layout.addWidget(self.time_label)
 
         self.volume_slider = ClickableSlider(Qt.Orientation.Horizontal)
@@ -804,6 +823,7 @@ class CyberPlayer(QMainWindow):
                     self.slider.setValue(scaled_pos)
                     self.slider.blockSignals(False)
                     self.time_label.setText(f"{self.format_time(display_pos)} / {self.format_time(dur)}")
+                    self.time_label.setToolTip(f"{pos:.3f}s / {dur:.3f}s")
                     
                     if self.active_media_path and not self.is_initializing:
                         self.playback_positions[self.active_media_path] = pos
@@ -1077,19 +1097,47 @@ class CyberPlayer(QMainWindow):
         except:
             return False
 
+    def _reposition_pause_overlay(self):
+        if not hasattr(self, 'pause_overlay'):
+            return
+        parent = self.video_fs_window if self.video_fs_window else self.viewport_container
+        size = 100
+        self.pause_overlay.setGeometry(
+            (parent.width() - size) // 2,
+            (parent.height() - size) // 2,
+            size, size
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition_pause_overlay()
+        if hasattr(self, 'pause_overlay') and self.pause_overlay.isVisible():
+            self.pause_overlay.raise_()
+
+    def _flash_overlay(self, is_paused):
+        self._reposition_pause_overlay()
+        if is_paused:
+            self.pause_overlay.setText("| |")
+            self.pause_overlay.raise_()
+            self.pause_overlay.show()
+        else:
+            self.pause_overlay.hide()
+
     def toggle_play(self):
         try:
             if self._is_at_end():
-                # Restart from beginning
                 self.player.time_pos = 0.0
                 self.player.pause = False
                 self.set_vector_icon(self.play_btn, SVG_PAUSE)
+                self._flash_overlay(False)
             elif not self.player.pause:
                 self.player.pause = True
                 self.set_vector_icon(self.play_btn, SVG_PLAY)
+                self._flash_overlay(True)
             else:
                 self.player.pause = False
                 self.set_vector_icon(self.play_btn, SVG_PAUSE)
+                self._flash_overlay(False)
         except Exception as e:
             print(f"Toggle play error: {e}")
 
@@ -1172,15 +1220,22 @@ class CyberPlayer(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Reparent video_frame and bottom_bar into the fullscreen window
+        # Reparent video_frame, bottom_bar and pause_overlay into the fullscreen window
         self.video_frame.setParent(self.video_fs_window)
         self.bottom_bar.setParent(self.video_fs_window)
+        self.pause_overlay.setParent(self.video_fs_window)
         layout.addWidget(self.video_frame)
         layout.addWidget(self.bottom_bar)
 
         self.video_fs_window.show()
         self.video_frame.show()
         self.bottom_bar.show()
+        if not self.player.pause:
+            self.pause_overlay.hide()
+        else:
+            self.pause_overlay.raise_()
+            self.pause_overlay.show()
+        QTimer.singleShot(50, lambda: (self._reposition_pause_overlay(), self.pause_overlay.raise_() if self.player.pause else None))
         QApplication.processEvents()
 
         try:
@@ -1214,10 +1269,18 @@ class CyberPlayer(QMainWindow):
         vl = self.viewport_container.layout()
         self.video_frame.setParent(self.viewport_container)
         self.bottom_bar.setParent(self.viewport_container)
+        self.pause_overlay.setParent(self.viewport_container)
         vl.insertWidget(0, self.video_frame)
         vl.addWidget(self.bottom_bar)
         self.video_frame.show()
         self.bottom_bar.show()
+        self._reposition_pause_overlay()
+        def _restore_overlay():
+            self._reposition_pause_overlay()
+            if hasattr(self, 'player') and self.player.pause:
+                self.pause_overlay.raise_()
+                self.pause_overlay.show()
+        QTimer.singleShot(150, _restore_overlay)
         QApplication.processEvents()
 
         def _rebind_wid():
@@ -1375,6 +1438,16 @@ class CyberPlayer(QMainWindow):
 # --- WINDOWS BOOTSTRAP INTERCEPTOR ---
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    app.setStyleSheet("""
+        QToolTip {
+            background-color: #0a0a0a;
+            color: #00f3ff;
+            border: 1px solid rgba(0, 243, 255, 0.4);
+            font-family: 'Consolas';
+            font-size: 11px;
+            padding: 4px 8px;
+        }
+    """)
     player = CyberPlayer()
     player.show()
     
