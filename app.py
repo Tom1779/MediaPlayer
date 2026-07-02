@@ -258,14 +258,10 @@ class CyberPlayer(QMainWindow):
             self.player.sub_use_osd = True
         except AttributeError:
             self.player._set_property('sub-use-osd', 'yes')
-
-        print(f"[MPV] version={self.player.mpv_version!r} libmpv={self.player.mpv_version!r}")
         
         self._file_loaded.connect(self.update_sub_styles)
-        self._file_loaded.connect(lambda: print(f"[FL] file-loaded fired, sub-font={self.player['sub-font']!r} sub-color={self.player['sub-color']!r} sub-border-size={self.player['sub-border-size']!r}"))
         self._sub_ready.connect(self._apply_pending_sub)
         self._sub_ready.connect(self.update_sub_styles)
-        self._sub_ready.connect(lambda: print(f"[SR] sub-ready fired, sub-font={self.player['sub-font']!r} sub-color={self.player['sub-color']!r} sub-border-size={self.player['sub-border-size']!r} sid={self.player['sid']!r}"))
 
         def _on_track_list_change(name, value):
             if value and any(t.get('type') == 'sub' for t in (value or [])):
