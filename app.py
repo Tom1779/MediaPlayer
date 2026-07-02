@@ -407,6 +407,13 @@ class CyberPlayer(QMainWindow):
         about_btn.clicked.connect(self.show_about)
         title_layout.addWidget(about_btn)
 
+        minimize_btn = QPushButton("─")
+        minimize_btn.setObjectName("MaximizeBtn")
+        minimize_btn.setFixedSize(45, 35)
+        minimize_btn.setToolTip("Minimize")
+        minimize_btn.clicked.connect(self.showMinimized)
+        title_layout.addWidget(minimize_btn)
+
         maximize_btn = QPushButton("❐")
         maximize_btn.setObjectName("MaximizeBtn")
         maximize_btn.setFixedSize(45, 35)
