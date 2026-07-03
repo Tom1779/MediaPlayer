@@ -128,6 +128,9 @@ class ClickableSlider(QSlider):
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
         self.is_user_dragging = False
+        self._format_time_fn = None
+        self._on_hover_fn = None  # called on any mouse move — used to reset fullscreen hide timer
+        self.setMouseTracking(True)
 
     def _value_from_x(self, x):
         val = self.minimum() + ((self.maximum() - self.minimum()) * x) / self.width()
@@ -151,6 +154,26 @@ class ClickableSlider(QSlider):
             event.accept()
         else:
             super().mouseMoveEvent(event)
+
+        if self._on_hover_fn:
+            self._on_hover_fn()
+
+        if self._format_time_fn and self.maximum() > 0:
+            val = self._value_from_x(event.position().x())
+            seconds = val / 100.0
+            from PyQt6.QtWidgets import QToolTip
+            QToolTip.showText(
+                event.globalPosition().toPoint(),
+                self._format_time_fn(seconds),
+                self,
+                self.rect(),
+                99999999
+            )
+
+    def leaveEvent(self, event):
+        from PyQt6.QtWidgets import QToolTip
+        QToolTip.hideText()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -202,6 +225,10 @@ class CyberPlayer(QMainWindow):
         self._controls_anim = None
 
         self.init_ui()
+
+        # Wire timeline slider tooltip to format_time
+        self.slider._format_time_fn = self.format_time
+        self.slider._on_hover_fn = self._reset_controls_timer
 
         # Lock time label width using explicit font construction — stylesheet may not be
         # applied yet when measuring, so we build the font directly to get accurate metrics.
@@ -493,7 +520,6 @@ class CyberPlayer(QMainWindow):
 
         self.time_label = QLabel("00:00:00 / 00:00:00")
         self.time_label.setObjectName("TimeLabel")
-        self.time_label.setToolTip("0.000s / 0.000s")
         controls_layout.addWidget(self.time_label)
 
         self.volume_slider = ClickableSlider(Qt.Orientation.Horizontal)
