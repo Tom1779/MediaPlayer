@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import math
 
 # --- FREEZE-PROOF SYSTEM PATH ANCHOR ---
 if getattr(sys, 'frozen', False):
@@ -14,7 +15,8 @@ CONFIG_FILE = os.path.join(exe_dir, "config.json")
 import mpv
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
                              QHBoxLayout, QWidget, QFileDialog, QListWidget, QLineEdit, 
-                             QSlider, QLabel, QColorDialog, QFontDialog, QMessageBox) 
+                             QSlider, QLabel, QColorDialog, QFontDialog, QMessageBox,
+                             QToolTip)
 from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal
 from PyQt6.QtWidgets import QGraphicsOpacityEffect
 from PyQt6.QtGui import QShortcut, QKeySequence, QIcon, QPixmap, QColor, QFont
@@ -161,7 +163,6 @@ class ClickableSlider(QSlider):
         if self._format_time_fn and self.maximum() > 0:
             val = self._value_from_x(event.position().x())
             seconds = val / 100.0
-            from PyQt6.QtWidgets import QToolTip
             QToolTip.showText(
                 event.globalPosition().toPoint(),
                 self._format_time_fn(seconds),
@@ -171,7 +172,6 @@ class ClickableSlider(QSlider):
             )
 
     def leaveEvent(self, event):
-        from PyQt6.QtWidgets import QToolTip
         QToolTip.hideText()
         super().leaveEvent(event)
 
@@ -204,7 +204,6 @@ class CyberPlayer(QMainWindow):
         self.current_sub_color = "#00f3ff" 
         self.current_sub_font = "Consolas" 
         self.current_volume = 100  
-        self.last_known_text = ""
         self.speed_steps = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
         self.speed_index = 3  # default 1.0x
         self.active_media_path = None
@@ -469,12 +468,6 @@ class CyberPlayer(QMainWindow):
         video_overlay_layout = QVBoxLayout(self.video_frame)
         video_overlay_layout.addStretch()
 
-        self.pyqt_sub_label = QLabel("")
-        self.pyqt_sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.pyqt_sub_label.setWordWrap(True)
-        self.pyqt_sub_label.hide()
-        
-        video_overlay_layout.addWidget(self.pyqt_sub_label, alignment=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
         viewport_layout.addWidget(self.video_frame, stretch=1)
         
         # --- FLOATING BOTTOM BAR DECK ---
@@ -482,22 +475,23 @@ class CyberPlayer(QMainWindow):
         self.bottom_bar.setObjectName("BottomBar")
 
         # Pause/play flash overlay — floats over viewport_container, above mpv's render surface
-        self.pause_overlay = QLabel(self.viewport_container)
+        # Pause overlay must be a separate top-level window to render transparently
+        # over mpv's native render surface (airspace problem — Qt can't alpha-blend
+        # over a foreign GPU surface, but the OS compositor can blend two windows).
+        self.pause_overlay = QLabel(None, 
+            Qt.WindowType.FramelessWindowHint | 
+            Qt.WindowType.Tool |
+            Qt.WindowType.WindowTransparentForInput |
+            Qt.WindowType.WindowStaysOnTopHint
+        )
         self.pause_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pause_overlay.setStyleSheet(
-            "color: rgba(255, 255, 255, 180); font-size: 72px; background: transparent; border: none; font-weight: bold;"
+            "color: white; font-size: 64px; font-weight: bold; background: transparent;"
         )
-        self.pause_overlay.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.pause_overlay.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton else None
+        self.pause_overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.pause_overlay.setFixedSize(100, 100)
         self.pause_overlay.hide()
 
-        # Override viewport_container resize to reposition overlay
-        def _vc_resize(event):
-            type(self.viewport_container).resizeEvent(self.viewport_container, event)
-            self._reposition_pause_overlay()
-            if self.pause_overlay.isVisible():
-                self.pause_overlay.raise_()
-        self.viewport_container.resizeEvent = _vc_resize
         self.bottom_bar.setFixedHeight(85)
         bottom_layout = QVBoxLayout(self.bottom_bar)
         bottom_layout.setContentsMargins(20, 5, 20, 15)
@@ -693,13 +687,8 @@ class CyberPlayer(QMainWindow):
         self.close()
 
     def calculate_boosted_volume(self, value):
-        """Map slider 0-100 to mpv volume 0-150 on a logarithmic curve.
-        Matches how human hearing perceives loudness — low end feels natural.
-        slider 10 -> mpv ~78, slider 25 -> mpv ~106, slider 50 -> mpv ~128, slider 100 -> mpv 150
-        """
         if value <= 0:
             return 0.0
-        import math
         return min(150.0, round(150.0 * math.log(1 + value) / math.log(101), 2))
 
     def adjust_system_volume(self, value):
@@ -757,27 +746,8 @@ class CyberPlayer(QMainWindow):
             
         self.timer.start()
 
-    def convert_rgb_to_mpv_hex(self, hex_str):
-        clean_hex = hex_str.lstrip('#')
-        r, g, b = clean_hex[0:2], clean_hex[2:4], clean_hex[4:6]
-        return f"00{b}{g}{r}".upper()
-
-    def _verify_sub_styles(self):
-        try:
-            color = self._rgb_to_mpv_color(self.current_sub_color)
-            if (self.player['osd-font'] != self.current_sub_font or
-                self.player['osd-font-size'] != int(self.current_sub_size) or
-                self.player['osd-color'] != color):
-                self.update_sub_styles()
-        except Exception:
-            pass
-
-    def _rgb_to_mpv_color(self, hex_color):
-        """Return color as-is — mpv sub-color accepts plain #RRGGBB."""
-        return hex_color
-
     def update_sub_styles(self):
-        color = self._rgb_to_mpv_color(self.current_sub_color)
+        color = self.current_sub_color
         for prop, val in [
             ('sub-ass-override',    'force'),
             ('sub-ass-force-style', 'ScaledBorderAndShadow=yes'),
@@ -799,20 +769,7 @@ class CyberPlayer(QMainWindow):
             except Exception as e:
                 print(f"Sub style error {prop}: {e}")
         
-        if self.last_known_text:
-            self.refresh_pyqt_label_styling()
 
-    def refresh_pyqt_label_styling(self):
-        inline_css = (
-            f"font-family: '{self.current_sub_font}'; "
-            f"font-size: {self.current_sub_size}px; "
-            f"color: {self.current_sub_color}; "
-            f"font-weight: bold; "
-            f"background-color: rgba(5, 5, 5, 180); "
-            f"padding: 12px 24px; "
-            f"border-radius: 6px;"
-        )
-        self.pyqt_sub_label.setStyleSheet(inline_css)
 
     def update_timeline(self):
         if self.is_awaiting_resume and not self.slider.is_user_dragging:
@@ -985,8 +942,6 @@ class CyberPlayer(QMainWindow):
         except Exception as e:
             print(f"Subtitle clear error: {e}")
         self._highlight_active_sub(None)
-        self.last_known_text = ""
-        self.pyqt_sub_label.hide()
         if self.active_media_path:
             self.custom_subs_map[self.active_media_path] = "none"
             self.save_configuration_memory()
@@ -1030,12 +985,12 @@ class CyberPlayer(QMainWindow):
                 self.player.loadfile(norm_path, 'replace', sub_file=saved_sub_path)
             self.player.pause = False
             self.set_vector_icon(self.play_btn, SVG_PAUSE)
+            self.pause_overlay.hide()
         except Exception as e:
             print(f"Decoder re-allocation anomaly: {e}")
 
         self._pending_sub = None  # no longer needed
         self._highlight_active_sub(None if saved_sub_path in ("none", "auto") else saved_sub_path)
-        self.pyqt_sub_label.hide()
         self.update_sub_styles()
 
         # Check if the database lookup position is validly past 0.5s
@@ -1128,13 +1083,20 @@ class CyberPlayer(QMainWindow):
     def _reposition_pause_overlay(self):
         if not hasattr(self, 'pause_overlay'):
             return
-        parent = self.viewport_container
         size = 100
-        self.pause_overlay.setGeometry(
-            (parent.width() - size) // 2,
-            (parent.height() - size) // 2,
-            size, size
+        vc = self.viewport_container
+        bar_height = self.bottom_bar.height() if hasattr(self, 'bottom_bar') else 0
+        video_height = vc.height() - bar_height
+        # Map to global coords since overlay is a top-level window
+        global_pos = vc.mapToGlobal(vc.rect().topLeft())
+        self.pause_overlay.move(
+            global_pos.x() + (vc.width() - size) // 2,
+            global_pos.y() + (video_height - size) // 2,
         )
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._reposition_pause_overlay()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1208,6 +1170,9 @@ class CyberPlayer(QMainWindow):
 
     def _show_controls(self):
         self._controls_hide_timer.stop()
+        if self._controls_opacity.opacity() == 1.0 and self.cursor().shape() != Qt.CursorShape.BlankCursor:
+            return
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         if self._controls_opacity.opacity() == 1.0:
             return
         self._controls_anim = QPropertyAnimation(self._controls_opacity, b"opacity")
@@ -1216,7 +1181,6 @@ class CyberPlayer(QMainWindow):
         self._controls_anim.setEndValue(1.0)
         self._controls_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self._controls_anim.start()
-        self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _reset_controls_timer(self):
         if self.video_fs_window is None:
@@ -1227,7 +1191,19 @@ class CyberPlayer(QMainWindow):
     def _minimize(self):
         if self.video_fs_window:
             self._exit_video_fullscreen()
+        self.pause_overlay.hide()
         self.showMinimized()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if hasattr(self, 'pause_overlay'):
+            from PyQt6.QtCore import QEvent
+            if event.type() == QEvent.Type.WindowStateChange:
+                if self.isMinimized():
+                    self.pause_overlay.hide()
+                elif hasattr(self, 'player') and self.player.pause:
+                    self._reposition_pause_overlay()
+                    self.pause_overlay.show()
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1266,10 +1242,11 @@ class CyberPlayer(QMainWindow):
         self._fs_esc.activated.connect(self._exit_video_fullscreen)
         self._fs_space = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self._fs_space.activated.connect(self.toggle_play)
+        self.shortcut_space.setEnabled(False)
 
         self._reset_controls_timer()
         self.showFullScreen()
-        self._reposition_pause_overlay()
+        QTimer.singleShot(50, self._reposition_pause_overlay)
 
     def _exit_video_fullscreen(self):
         if self.video_fs_window is None:
@@ -1298,6 +1275,8 @@ class CyberPlayer(QMainWindow):
         if hasattr(self, '_fs_esc'):
             self._fs_esc.deleteLater()
             self._fs_space.deleteLater()
+        self.shortcut_space.setEnabled(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         if getattr(self, '_pre_fs_maximized', False):
             self.showFullScreen()
