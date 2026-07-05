@@ -379,6 +379,10 @@ class CyberPlayer(QMainWindow):
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
         self.file_list.itemDoubleClicked.connect(self.play_from_list)
+        self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(
+            lambda pos: self._show_vault_context_menu(pos, self.file_list, 'media')
+        )
         side_layout.addWidget(self.file_list)
 
         subs_header = QHBoxLayout()
@@ -402,6 +406,10 @@ class CyberPlayer(QMainWindow):
         self.sub_list = QListWidget()
         self.sub_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
         self.sub_list.itemDoubleClicked.connect(self.play_sub_from_list)
+        self.sub_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sub_list.customContextMenuRequested.connect(
+            lambda pos: self._show_vault_context_menu(pos, self.sub_list, 'subtitle')
+        )
         side_layout.addWidget(self.sub_list)
         
         main_layout.addWidget(side_panel)
@@ -1204,6 +1212,12 @@ class CyberPlayer(QMainWindow):
                 elif hasattr(self, 'player') and self.player.pause:
                     self._reposition_pause_overlay()
                     self.pause_overlay.show()
+            elif event.type() == QEvent.Type.ActivationChange:
+                if not self.isActiveWindow():
+                    self.pause_overlay.hide()
+                elif hasattr(self, 'player') and self.player.pause:
+                    self._reposition_pause_overlay()
+                    self.pause_overlay.show()
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1283,6 +1297,43 @@ class CyberPlayer(QMainWindow):
         else:
             self.showNormal()
         self._reposition_pause_overlay()
+
+    def _show_vault_context_menu(self, pos, list_widget, vault_type):
+        item = list_widget.itemAt(pos)
+        if not item:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+
+        from PyQt6.QtWidgets import QMenu
+        from PyQt6.QtGui import QAction
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background-color: #0a0a0a; border: 1px solid #00f3ff; color: #00f3ff; font-family: Consolas; font-size: 12px; }
+            QMenu::item { padding: 6px 24px; }
+            QMenu::item:selected { background-color: rgba(0, 243, 255, 0.15); color: #ffffff; }
+        """)
+        remove_action = QAction("✕  Remove from vault", self)
+        remove_action.triggered.connect(lambda: self._remove_from_vault(path, item, list_widget, vault_type))
+        menu.addAction(remove_action)
+        menu.exec(list_widget.mapToGlobal(pos))
+
+    def _remove_from_vault(self, path, item, list_widget, vault_type):
+        list_widget.takeItem(list_widget.row(item))
+        if vault_type == 'media':
+            if path in self.media_files:
+                self.media_files.remove(path)
+            if path in self.custom_subs_map:
+                del self.custom_subs_map[path]
+            if path == self.active_media_path:
+                self.active_media_path = None
+        else:
+            if path in self.subtitle_files:
+                self.subtitle_files.remove(path)
+            # Remove from custom_subs_map if it was mapped to any video
+            keys_to_update = [k for k, v in self.custom_subs_map.items() if v == path]
+            for k in keys_to_update:
+                del self.custom_subs_map[k]
+        self.save_configuration_memory()
 
     def _highlight_active_media(self, active_path):
         """Bold and colour the active media entry in the vault; reset all others."""
