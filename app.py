@@ -256,14 +256,11 @@ class CyberPlayer(QMainWindow):
         QApplication.instance().installEventFilter(self._resize_filter)
 
         # Initialize MPV Engine
-        _empty_config_dir = os.path.join(exe_dir, 'mpv_config')
-        os.makedirs(_empty_config_dir, exist_ok=True)
         self.player = mpv.MPV(
             wid=str(int(self.video_frame.winId())),
             force_window=True,
             keep_open='yes',
             volume_max=150.0,
-            config_dir=_empty_config_dir,
             vo='gpu',
             sub_ass_override='force',
             sub_ass_force_style='ScaledBorderAndShadow=yes',
@@ -302,7 +299,15 @@ class CyberPlayer(QMainWindow):
         self._on_file_loaded_cb = _on_file_loaded
 
         last_played_media = self.load_configuration_memory()
-        self.update_sub_styles() 
+        self.update_sub_styles()
+
+        # Apply saved speed
+        speed = self.speed_steps[self.speed_index]
+        self.speed_btn.setText(f"{speed}x")
+        try:
+            self.player.speed = speed
+        except Exception:
+            pass 
         
         self.current_volume = max(0, min(100, int(self.current_volume)))
         self.volume_slider.setValue(self.current_volume)
@@ -603,7 +608,10 @@ class CyberPlayer(QMainWindow):
             self.current_sub_font = memory.get("font_family", "Consolas")
             self.current_sub_size = memory.get("font_size", 36)
             self.current_sub_color = memory.get("font_color", "#00f3ff")
-            self.current_volume = memory.get("system_volume_level", 100) 
+            self.current_volume = memory.get("system_volume_level", 100)
+            saved_speed = memory.get("playback_speed", 1.0)
+            if saved_speed in self.speed_steps:
+                self.speed_index = self.speed_steps.index(saved_speed) 
             
             raw_positions = memory.get("playback_positions", {})
             self.playback_positions = {k.lower().replace('\\', '/'): v for k, v in raw_positions.items()}
@@ -659,7 +667,8 @@ class CyberPlayer(QMainWindow):
             "font_family": self.current_sub_font,
             "font_size": self.current_sub_size,
             "font_color": self.current_sub_color,
-            "system_volume_level": int(self.current_volume), 
+            "system_volume_level": int(self.current_volume),
+            "playback_speed": self.speed_steps[self.speed_index], 
             "last_active_media_file": self.active_media_path if self.active_media_path else on_disk_memory.get("last_active_media_file", None),
             "media_files_playlist": self.media_files,
             "subtitle_files_playlist": self.subtitle_files,
@@ -851,6 +860,7 @@ class CyberPlayer(QMainWindow):
         except Exception as e:
             print(f"Speed change error: {e}")
         self.speed_btn.setText(f"{speed}x")
+        self.save_configuration_memory()
 
     def format_time(self, total_seconds):
         if total_seconds is None: return "00:00:00"
