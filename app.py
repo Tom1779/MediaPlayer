@@ -646,12 +646,6 @@ class CyberPlayer(QMainWindow):
             except Exception as e:
                 print(f"Config disk read error: {e}")
 
-        disk_media_playlist = [p.lower().replace('\\', '/') for p in on_disk_memory.get("media_files_playlist", [])]
-        disk_sub_playlist = [p.lower().replace('\\', '/') for p in on_disk_memory.get("subtitle_files_playlist", [])]
-        
-        merged_media_playlist = list(set(self.media_files + disk_media_playlist))
-        merged_sub_playlist = list(set(self.subtitle_files + disk_sub_playlist))
-        
         disk_positions = {k.lower().replace('\\', '/'): v for k, v in on_disk_memory.get("playback_positions", {}).items()}
         disk_positions.update(self.playback_positions)
         
@@ -667,8 +661,8 @@ class CyberPlayer(QMainWindow):
             "font_color": self.current_sub_color,
             "system_volume_level": int(self.current_volume), 
             "last_active_media_file": self.active_media_path if self.active_media_path else on_disk_memory.get("last_active_media_file", None),
-            "media_files_playlist": merged_media_playlist,
-            "subtitle_files_playlist": merged_sub_playlist,
+            "media_files_playlist": self.media_files,
+            "subtitle_files_playlist": self.subtitle_files,
             "custom_subs_map": disk_subs_map,
             "playback_positions": disk_positions
         }
@@ -1329,6 +1323,9 @@ class CyberPlayer(QMainWindow):
         else:
             if path in self.subtitle_files:
                 self.subtitle_files.remove(path)
+            # If this sub is currently active, clear it
+            if self.active_media_path and self.custom_subs_map.get(self.active_media_path) == path:
+                self.clear_subtitle()
             # Remove from custom_subs_map if it was mapped to any video
             keys_to_update = [k for k, v in self.custom_subs_map.items() if v == path]
             for k in keys_to_update:
