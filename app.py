@@ -438,7 +438,7 @@ class CyberPlayer(QMainWindow):
         minimize_btn.setObjectName("MaximizeBtn")
         minimize_btn.setFixedSize(45, 35)
         minimize_btn.setToolTip("Minimize")
-        minimize_btn.clicked.connect(self.showMinimized)
+        minimize_btn.clicked.connect(self._minimize)
         title_layout.addWidget(minimize_btn)
 
         maximize_btn = QPushButton("❐")
@@ -457,12 +457,14 @@ class CyberPlayer(QMainWindow):
         
         self.viewport_container = QWidget()
         self.viewport_container.setStyleSheet("background-color: #000000;")
+        self.viewport_container.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton else None
         viewport_layout = QVBoxLayout(self.viewport_container)
         self.viewport_container.setContentsMargins(0, 0, 0, 0)
         viewport_layout.setSpacing(0)
         
         self.video_frame = QWidget()
         self.video_frame.setStyleSheet("background-color: #000000;")
+        self.video_frame.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton else None
         
         video_overlay_layout = QVBoxLayout(self.video_frame)
         video_overlay_layout.addStretch()
@@ -485,8 +487,8 @@ class CyberPlayer(QMainWindow):
         self.pause_overlay.setStyleSheet(
             "color: rgba(255, 255, 255, 180); font-size: 72px; background: transparent; border: none; font-weight: bold;"
         )
-        self.pause_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.pause_overlay.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.pause_overlay.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton else None
         self.pause_overlay.hide()
 
         # Override viewport_container resize to reposition overlay
@@ -716,7 +718,7 @@ class CyberPlayer(QMainWindow):
 
     def open_color_dialog(self):
         self.timer.stop()
-        parent = self.video_fs_window if self.video_fs_window is not None else self
+        parent = self
         dialog = QColorDialog(parent)
         dialog.setCurrentColor(QColor(self.current_sub_color))
         dialog.setWindowTitle("CHOOSE SUBTITLE COLOR")
@@ -732,7 +734,7 @@ class CyberPlayer(QMainWindow):
 
     def open_font_dialog(self):
         self.timer.stop()
-        parent = self.video_fs_window if self.video_fs_window is not None else self
+        parent = self
         dialog = QFontDialog(parent)
         dialog.setOption(QFontDialog.FontDialogOption.DontUseNativeDialog, True)
         dialog.setOption(QFontDialog.FontDialogOption.ScalableFonts, True)
@@ -1090,7 +1092,7 @@ class CyberPlayer(QMainWindow):
             print(f"Pause error: {e}")
         time_str = self.format_time(target_seconds)
         
-        parent = self.video_fs_window if self.video_fs_window is not None else self
+        parent = self
         reply = QMessageBox.question(
             parent,
             "SYS.MEMORY // DECK RESUME", 
@@ -1126,7 +1128,7 @@ class CyberPlayer(QMainWindow):
     def _reposition_pause_overlay(self):
         if not hasattr(self, 'pause_overlay'):
             return
-        parent = self.video_fs_window if self.video_fs_window else self.viewport_container
+        parent = self.viewport_container
         size = 100
         self.pause_overlay.setGeometry(
             (parent.width() - size) // 2,
@@ -1202,7 +1204,7 @@ class CyberPlayer(QMainWindow):
         self._controls_anim.setEndValue(0.0)
         self._controls_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self._controls_anim.start()
-        self.video_fs_window.setCursor(Qt.CursorShape.BlankCursor)
+        self.setCursor(Qt.CursorShape.BlankCursor)
 
     def _show_controls(self):
         self._controls_hide_timer.stop()
@@ -1214,8 +1216,7 @@ class CyberPlayer(QMainWindow):
         self._controls_anim.setEndValue(1.0)
         self._controls_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self._controls_anim.start()
-        if self.video_fs_window:
-            self.video_fs_window.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _reset_controls_timer(self):
         if self.video_fs_window is None:
@@ -1223,9 +1224,16 @@ class CyberPlayer(QMainWindow):
         self._show_controls()
         self._controls_hide_timer.start()
 
+    def _minimize(self):
+        if self.video_fs_window:
+            self._exit_video_fullscreen()
+        self.showMinimized()
+
     def toggle_fullscreen(self):
-        if self.isFullScreen(): self.showNormal()
-        else: self.showFullScreen()
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
 
     def toggle_video_fullscreen(self):
         if self.video_fs_window is not None:
@@ -1234,108 +1242,68 @@ class CyberPlayer(QMainWindow):
             self._enter_video_fullscreen()
 
     def _enter_video_fullscreen(self):
-        from PyQt6.QtGui import QShortcut
+        # Capture window state FIRST before anything changes it
+        # Frameless windows don't report isMaximized() correctly.
+        # Detect by comparing geometry to available screen geometry.
+        screen_geom = QApplication.primaryScreen().availableGeometry()
+        self._pre_fs_maximized = self.geometry() == screen_geom
+        self.video_fs_window = True
 
-        screen = QApplication.primaryScreen().geometry()
+        # Hide side panel and title bar, keep only the video area
+        self.centralWidget().layout().itemAt(0).widget().hide()  # side panel
+        self.title_bar.hide()
 
-        self.video_fs_window = QWidget(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
-        self.video_fs_window.setStyleSheet("background-color: #000000;")
-        self.video_fs_window.setGeometry(screen)
-
-        layout = QVBoxLayout(self.video_fs_window)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # Reparent video_frame, bottom_bar and pause_overlay into the fullscreen window
-        self.video_frame.setParent(self.video_fs_window)
-        self.bottom_bar.setParent(self.video_fs_window)
-        self.pause_overlay.setParent(self.video_fs_window)
-        layout.addWidget(self.video_frame)
-        layout.addWidget(self.bottom_bar)
-
-        self.video_fs_window.show()
-        self.video_frame.show()
-        self.bottom_bar.show()
-        if not self.player.pause:
-            self.pause_overlay.hide()
-        else:
-            self.pause_overlay.raise_()
-            self.pause_overlay.show()
-        QTimer.singleShot(50, lambda: (self._reposition_pause_overlay(), self.pause_overlay.raise_() if self.player.pause else None))
-        QApplication.processEvents()
-
-        try:
-            self.player.wid = str(int(self.video_frame.winId()))
-        except Exception:
-            pass
-
-        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.video_fs_window)
-        esc.activated.connect(self._exit_video_fullscreen)
-
-        # Wire opacity effect to bottom bar and start auto-hide
+        # Wire auto-hide controls
         self.bottom_bar.setGraphicsEffect(self._controls_opacity)
         self._controls_opacity.setOpacity(1.0)
-        self.video_fs_window.setMouseTracking(True)
+        self.viewport_container.setMouseTracking(True)
         self.video_frame.setMouseTracking(True)
-        self.video_fs_window.mouseMoveEvent = lambda e: self._reset_controls_timer()
-        # Click on video area (not bottom bar) toggles play/pause
-        self.video_frame.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton else None
-        # Steal keyboard focus so spacebar works immediately
-        self.video_fs_window.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        QShortcut(QKeySequence(Qt.Key.Key_Space), self.video_fs_window).activated.connect(self.toggle_play)
-        self.video_fs_window.setFocus()
-        self._reset_controls_timer()
+        self.viewport_container.mouseMoveEvent = lambda e: self._reset_controls_timer()
 
-        self.video_fs_window.showFullScreen()
+        # Escape to exit
+        from PyQt6.QtGui import QShortcut
+        self._fs_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._fs_esc.activated.connect(self._exit_video_fullscreen)
+        self._fs_space = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._fs_space.activated.connect(self.toggle_play)
+
+        self._reset_controls_timer()
+        self.showFullScreen()
+        self._reposition_pause_overlay()
 
     def _exit_video_fullscreen(self):
         if self.video_fs_window is None:
             return
 
-        vl = self.viewport_container.layout()
-        self.video_frame.setParent(self.viewport_container)
-        self.bottom_bar.setParent(self.viewport_container)
-        self.pause_overlay.setParent(self.viewport_container)
-        vl.insertWidget(0, self.video_frame)
-        vl.addWidget(self.bottom_bar)
-        self.video_frame.show()
-        self.bottom_bar.show()
-        self._reposition_pause_overlay()
-        def _restore_overlay():
-            self._reposition_pause_overlay()
-            if hasattr(self, 'player') and self.player.pause:
-                self.pause_overlay.raise_()
-                self.pause_overlay.show()
-        QTimer.singleShot(150, _restore_overlay)
-        QApplication.processEvents()
+        self.video_fs_window = None
 
-        def _rebind_wid():
-            try:
-                self.player.wid = str(int(self.video_frame.winId()))
-            except Exception:
-                pass
+        # Restore side panel and title bar
+        self.centralWidget().layout().itemAt(0).widget().show()  # side panel
+        self.title_bar.show()
 
-        QTimer.singleShot(50, _rebind_wid)
-
-        # Clean up auto-hide and fullscreen-specific event overrides
+        # Clean up auto-hide
         self._controls_hide_timer.stop()
         if self._controls_anim is not None:
             self._controls_anim.stop()
             self._controls_anim = None
         self.bottom_bar.setGraphicsEffect(None)
-        # Delete instance override so base Qt handler takes over again
-        try:
-            del self.video_frame.mousePressEvent
-        except AttributeError:
-            pass
-        # Fresh effect for next fullscreen entry
         self._controls_opacity = QGraphicsOpacityEffect()
         self._controls_opacity.setOpacity(1.0)
-        if self.video_fs_window:
-            self.video_fs_window.setCursor(Qt.CursorShape.ArrowCursor)
 
-        self.video_fs_window.close()
-        self.video_fs_window = None
+        # Remove fullscreen mouse/keyboard overrides
+        try:
+            del self.viewport_container.mouseMoveEvent
+        except AttributeError:
+            pass
+        if hasattr(self, '_fs_esc'):
+            self._fs_esc.deleteLater()
+            self._fs_space.deleteLater()
+
+        if getattr(self, '_pre_fs_maximized', False):
+            self.showFullScreen()
+        else:
+            self.showNormal()
+        self._reposition_pause_overlay()
 
     def _highlight_active_media(self, active_path):
         """Bold and colour the active media entry in the vault; reset all others."""
@@ -1402,9 +1370,6 @@ class CyberPlayer(QMainWindow):
 
     def _handle_mouse_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self.isFullScreen():
-            # Ignore events that belong to a different top-level window (e.g. video_fs_window)
-            if self.video_fs_window is not None:
-                return False
             pos = self.mapFromGlobal(event.globalPosition().toPoint())
             edge = self._get_resize_edge(pos)
             if edge:
@@ -1422,8 +1387,6 @@ class CyberPlayer(QMainWindow):
 
     def _handle_mouse_move(self, event):
         if self.isFullScreen():
-            return
-        if self.video_fs_window is not None:
             return
         pos = self.mapFromGlobal(event.globalPosition().toPoint())
         gpos = event.globalPosition().toPoint()
