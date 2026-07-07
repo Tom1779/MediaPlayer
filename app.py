@@ -207,7 +207,9 @@ class CyberPlayer(QMainWindow):
         self.speed_steps = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
         self.speed_index = 3  # default 1.0x
         self.active_media_path = None
-        self._pending_sub = None  # sub action deferred until file-loaded
+        self._pending_sub = None
+        self._is_switching = False
+        self._user_paused = False  # tracks whether USER intentionally paused  # sub action deferred until file-loaded
         self.is_awaiting_resume = False 
         self.pending_resume_seconds = 0.0 
         self.is_initializing = True
@@ -469,14 +471,14 @@ class CyberPlayer(QMainWindow):
         
         self.viewport_container = QWidget()
         self.viewport_container.setStyleSheet("background-color: #000000;")
-        self.viewport_container.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton else None
+        self.viewport_container.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton and not getattr(self, '_is_switching', False) else None
         viewport_layout = QVBoxLayout(self.viewport_container)
         self.viewport_container.setContentsMargins(0, 0, 0, 0)
         viewport_layout.setSpacing(0)
         
         self.video_frame = QWidget()
         self.video_frame.setStyleSheet("background-color: #000000;")
-        self.video_frame.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton else None
+        self.video_frame.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton and not getattr(self, '_is_switching', False) else None
         
         video_overlay_layout = QVBoxLayout(self.video_frame)
         video_overlay_layout.addStretch()
@@ -890,7 +892,18 @@ class CyberPlayer(QMainWindow):
             pass
 
     def load_media(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, "Select Media", "", "Media (*.mp4 *.mkv *.avi *.mp3 *.flac *.wav)")
+        filepath, _ = QFileDialog.getOpenFileName(self, "Select Media", "", 
+            "Media Files (*.mp4 *.m4v *.mkv *.avi *.mov *.wmv *.asf *.flv *.f4v *.webm "
+            "*.ts *.mts *.m2ts *.mpeg *.mpg *.m2v *.ogv *.ogg *.3gp *.3g2 *.divx "
+            "*.rmvb *.rm *.vob *.m4b "
+            "*.mp3 *.flac *.wav *.aac *.m4a *.oga *.opus *.wma *.aiff *.aif "
+            "*.alac *.dts *.ac3 *.eac3 *.ape *.mka *.mp2 *.dsf *.dff);;"
+            "Video (*.mp4 *.m4v *.mkv *.avi *.mov *.wmv *.asf *.flv *.f4v *.webm "
+            "*.ts *.mts *.m2ts *.mpeg *.mpg *.m2v *.ogv *.ogg *.3gp *.3g2 *.divx *.rmvb *.rm *.vob *.m4b);;"
+            "Audio (*.mp3 *.flac *.wav *.aac *.m4a *.oga *.opus *.wma *.aiff *.aif "
+            "*.alac *.dts *.ac3 *.eac3 *.ape *.mka *.mp2 *.dsf *.dff);;"
+            "All Files (*.*)"
+        )
         if filepath:
             self.play_file(filepath)
 
@@ -962,6 +975,9 @@ class CyberPlayer(QMainWindow):
         self.is_initializing = True
         self.is_awaiting_resume = False
         self.pending_resume_seconds = 0.0
+        self._is_switching = True
+        self._user_paused = False
+        self.pause_overlay.hide()
         
         norm_path = filepath.lower().replace('\\', '/')
         
@@ -998,6 +1014,7 @@ class CyberPlayer(QMainWindow):
             self.player.pause = False
             self.set_vector_icon(self.play_btn, SVG_PAUSE)
             self.pause_overlay.hide()
+            self._is_switching = False
         except Exception as e:
             print(f"Decoder re-allocation anomaly: {e}")
 
@@ -1118,7 +1135,7 @@ class CyberPlayer(QMainWindow):
 
     def _flash_overlay(self, is_paused):
         self._reposition_pause_overlay()
-        if is_paused:
+        if is_paused and self._user_paused and not self._is_switching:
             self.pause_overlay.setText("| |")
             self.pause_overlay.raise_()
             self.pause_overlay.show()
@@ -1131,14 +1148,17 @@ class CyberPlayer(QMainWindow):
                 self.player.time_pos = 0.0
                 self.player.pause = False
                 self.set_vector_icon(self.play_btn, SVG_PAUSE)
+                self._user_paused = False
                 self._flash_overlay(False)
             elif not self.player.pause:
                 self.player.pause = True
                 self.set_vector_icon(self.play_btn, SVG_PLAY)
+                self._user_paused = True
                 self._flash_overlay(True)
             else:
                 self.player.pause = False
                 self.set_vector_icon(self.play_btn, SVG_PAUSE)
+                self._user_paused = False
                 self._flash_overlay(False)
         except Exception as e:
             print(f"Toggle play error: {e}")
@@ -1213,13 +1233,13 @@ class CyberPlayer(QMainWindow):
             if event.type() == QEvent.Type.WindowStateChange:
                 if self.isMinimized():
                     self.pause_overlay.hide()
-                elif hasattr(self, 'player') and self.player.pause:
+                elif self._user_paused:
                     self._reposition_pause_overlay()
                     self.pause_overlay.show()
             elif event.type() == QEvent.Type.ActivationChange:
                 if not self.isActiveWindow():
                     self.pause_overlay.hide()
-                elif hasattr(self, 'player') and self.player.pause:
+                elif self._user_paused:
                     self._reposition_pause_overlay()
                     self.pause_overlay.show()
 
@@ -1247,12 +1267,25 @@ class CyberPlayer(QMainWindow):
         self.centralWidget().layout().itemAt(0).widget().hide()  # side panel
         self.title_bar.hide()
 
-        # Wire auto-hide controls
+        # Wire auto-hide controls — install event filter on app so mouse moves
+        # anywhere in the window trigger the controls, regardless of which child
+        # widget is under the cursor.
         self.bottom_bar.setGraphicsEffect(self._controls_opacity)
         self._controls_opacity.setOpacity(1.0)
+        self.setMouseTracking(True)
+        self.centralWidget().setMouseTracking(True)
         self.viewport_container.setMouseTracking(True)
         self.video_frame.setMouseTracking(True)
-        self.viewport_container.mouseMoveEvent = lambda e: self._reset_controls_timer()
+        self.bottom_bar.setMouseTracking(True)
+
+        from PyQt6.QtCore import QObject, QEvent as QEv
+        class _FsMouseFilter(QObject):
+            def eventFilter(self_, obj, event):
+                if event.type() == QEv.Type.MouseMove:
+                    self._reset_controls_timer()
+                return False
+        self._fs_mouse_filter = _FsMouseFilter(self)
+        QApplication.instance().installEventFilter(self._fs_mouse_filter)
 
         # Escape to exit
         from PyQt6.QtGui import QShortcut
@@ -1286,6 +1319,13 @@ class CyberPlayer(QMainWindow):
         self._controls_opacity.setOpacity(1.0)
 
         # Remove fullscreen mouse/keyboard overrides
+        if hasattr(self, '_fs_mouse_filter'):
+            QApplication.instance().removeEventFilter(self._fs_mouse_filter)
+            self._fs_mouse_filter = None
+        self.setMouseTracking(False)
+        self.viewport_container.setMouseTracking(False)
+        self.video_frame.setMouseTracking(False)
+        self.bottom_bar.setMouseTracking(False)
         try:
             del self.viewport_container.mouseMoveEvent
         except AttributeError:
