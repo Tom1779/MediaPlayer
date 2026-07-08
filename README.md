@@ -10,6 +10,7 @@ A cyberpunk-styled desktop media player built with Python, PyQt6, and libmpv. Th
   - [Table of Contents](#table-of-contents)
   - [1. Architecture Overview](#1-architecture-overview)
   - [2. Bootstrap and Path Anchoring](#2-bootstrap-and-path-anchoring)
+    - [Taskbar Icon Fix](#taskbar-icon-fix)
   - [3. Stylesheet System](#3-stylesheet-system)
   - [4. ClickableSlider](#4-clickableslider)
   - [5. CyberPlayer Class — State Initialization](#5-cyberplayer-class--state-initialization)
@@ -86,9 +87,11 @@ All persistent state is stored in a single `config.json` file next to `app.py`. 
 
 ```python
 if getattr(sys, 'frozen', False):
-    exe_dir = os.path.dirname(sys.executable)
+    exe_dir = os.path.dirname(sys.executable)   # real .exe location (config, dlls)
+    bundle_dir = sys._MEIPASS                    # temp extraction dir (bundled assets)
 else:
     exe_dir = os.path.dirname(os.path.abspath(__file__))
+    bundle_dir = exe_dir
 
 os.environ["PATH"] = exe_dir + os.pathsep + os.environ["PATH"]
 CONFIG_FILE = os.path.join(exe_dir, "config.json")
@@ -96,9 +99,36 @@ CONFIG_FILE = os.path.join(exe_dir, "config.json")
 
 **Why this exists:** When packaged with PyInstaller (`sys.frozen = True`), the executable directory is different from the script directory. `__file__` doesn't work reliably in frozen mode. The `getattr(sys, 'frozen', False)` check handles both development (running `app.py` directly) and distribution (running a compiled `.exe`).
 
-**PATH injection:** libmpv needs to find its DLL (`mpv-2.dll` on Windows). Prepending `exe_dir` to `PATH` ensures mpv's DLL is found whether the app is run from the project folder or from any other working directory.
+**`exe_dir` vs `bundle_dir`:** These are two distinct locations in a PyInstaller `--onefile` build and must not be conflated:
 
-**CONFIG_FILE:** Anchored to `exe_dir` rather than the current working directory, so the config is always found next to the executable regardless of where the app is launched from.
+- **`exe_dir`** (`os.path.dirname(sys.executable)`) — the directory containing `CyberPlayer.exe`. Files here are visible to the user: `config.json`, `libmpv-2.dll`. These are not inside the exe and live permanently on disk next to it.
+- **`bundle_dir`** (`sys._MEIPASS`) — a temporary folder created at launch (e.g. `C:\Users\...\AppData\Local\Temp\_MEI12345\`). PyInstaller extracts all bundled assets here at startup. Files specified in the spec's `datas` (like `icon.ico`) land here, not in `exe_dir`.
+
+In dev mode, both point to the same directory (the project folder), so the distinction only matters in the packaged build.
+
+**PATH injection:** libmpv needs to find its DLL (`libmpv-2.dll` on Windows). Prepending `exe_dir` to `PATH` ensures mpv's DLL is found whether the app is run from the project folder or from any other working directory.
+
+**CONFIG_FILE:** Anchored to `exe_dir` so the config lives next to the executable permanently. Using `bundle_dir` here would be wrong — the temp folder is deleted when the app exits.
+
+### Taskbar Icon Fix
+
+The icon path must use `bundle_dir`, not `exe_dir`:
+
+```python
+icon_path = os.path.join(bundle_dir, 'icon.ico')
+```
+
+**The bug:** `icon.ico` is declared in the spec's `datas` (`('icon.ico', '.')`), which means PyInstaller extracts it into `sys._MEIPASS` (`bundle_dir`) at runtime. The original code used `exe_dir` for the icon path — `dist/icon.ico` — which does not exist. `QIcon` silently produces an empty icon object when given a missing path, so `app.setWindowIcon()` and `player.setWindowIcon()` both appeared to succeed but set nothing. The result was the PyInstaller bootloader's generic default icon showing in the taskbar.
+
+This was confirmed by checking `os.path.exists(icon_path)` — it returned `False` in the packed exe, so the `setWindowIcon` calls were never even reached.
+
+**AUMID:** The Application User Model ID is set before `QApplication` is created:
+
+```python
+ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(u'CyberPlayer.App.1')
+```
+
+This ensures Windows assigns the taskbar button to this process and reads the icon correctly. The AUMID call returns `S_OK` (`0`) regardless of whether the icon path is valid — it was not the cause of the missing taskbar icon, but is still necessary for correct taskbar grouping behavior.
 
 ---
 

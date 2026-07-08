@@ -5,9 +5,11 @@ import math
 
 # --- FREEZE-PROOF SYSTEM PATH ANCHOR ---
 if getattr(sys, 'frozen', False):
-    exe_dir = os.path.dirname(sys.executable)
+    exe_dir = os.path.dirname(sys.executable)   # real .exe location (config, dlls)
+    bundle_dir = sys._MEIPASS                    # temp extraction dir (bundled assets)
 else:
     exe_dir = os.path.dirname(os.path.abspath(__file__))
+    bundle_dir = exe_dir
 
 os.environ["PATH"] = exe_dir + os.pathsep + os.environ["PATH"]
 CONFIG_FILE = os.path.join(exe_dir, "config.json")
@@ -1503,7 +1505,23 @@ class CyberPlayer(QMainWindow):
 
 # --- WINDOWS BOOTSTRAP INTERCEPTOR ---
 if __name__ == '__main__':
+    # Set AUMID before QApplication so Windows assigns the taskbar button
+    # to this process and reads the icon from the embedded exe resource.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(u'CyberPlayer.App.1')
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+
+    # bundle_dir points to sys._MEIPASS when frozen (where icon.ico is extracted),
+    # and to exe_dir in dev — this is the fix for the taskbar icon not showing.
+    icon_path = os.path.join(bundle_dir, 'icon.ico')
+    if os.path.exists(icon_path):
+        app_icon = QIcon(icon_path)
+        app.setWindowIcon(app_icon)
+
     app.setStyleSheet("""
         QToolTip {
             background-color: #0a0a0a;
@@ -1515,11 +1533,13 @@ if __name__ == '__main__':
         }
     """)
     player = CyberPlayer()
+    if os.path.exists(icon_path):
+        player.setWindowIcon(app_icon)
     player.show()
-    
+
     if len(sys.argv) > 1:
         target_file = os.path.normpath(sys.argv[1]).lower().replace('\\', '/')
         if os.path.exists(target_file):
             QTimer.singleShot(250, lambda: player.play_file(target_file))
-            
+
     sys.exit(app.exec())
