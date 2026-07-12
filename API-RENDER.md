@@ -76,6 +76,7 @@ A cyberpunk-styled desktop media player built with Python, PyQt6, and libmpv. Th
   - [22. Dependencies](#22-dependencies)
     - [Why python-mpv over alternatives](#why-python-mpv-over-alternatives)
   - [Known Limitations](#known-limitations)
+  - [Memory Usage](#memory-usage)
 
 ---
 
@@ -856,3 +857,19 @@ mpv has a mature C API (`libmpv`) designed specifically for embedding in other a
 - **`vo='libmpv'` requires render context before playback:** If a file is somehow loaded before `initializeGL()` fires (before the window is shown), mpv will fail to initialize its VO. The `app.processEvents()` calls in `__main__` after `player.show()` mitigate this by forcing Qt to process the initial paint event before any file load.
 
 - **PyQt6 without ANGLE:** The render API requires Qt's native desktop OpenGL (WGL on Windows). ANGLE (OpenGL ES over D3D11) was removed from Qt 6 and is not available in any PyPI PyQt6 build. Attempts to use `AA_UseOpenGLES` or `AA_UseDesktopOpenGL` with `MpvRenderContext` cause crashes.
+
+---
+
+## Memory Usage
+
+This branch uses approximately 250MB of RAM at runtime, compared to ~150MB for the main (`wid=`) branch. The ~100MB difference has four causes:
+
+**60fps render timer (largest factor):** In the `wid=` branch, mpv drives its own render loop internally at the OS level — Python and Qt are mostly idle between events. In this branch, a `QTimer` fires every 16ms, waking the Qt event loop, calling `paintGL()`, which calls `ctx.render()`, which invokes libplacebo's full shader pipeline. That's 60 GPU→CPU round trips per second even when paused or playing audio-only content. The process stays hot in memory rather than idling.
+
+**libplacebo shader compilation:** When `MpvRenderContext` initializes, libplacebo compiles the `ewa_lanczossharp` and debanding shaders and caches the compiled objects in process memory for the lifetime of the app. `vo='gpu'` uses much simpler shaders that compile smaller.
+
+**`QOpenGLWidget` GL context overhead:** `QOpenGLWidget` maintains its own OpenGL context, framebuffer objects, and texture buffers that a plain `QWidget` doesn't. On Windows this includes a shadow copy of the backbuffer. Rough cost: 20-40MB depending on window resolution.
+
+**Property observer overhead:** Two additional constantly-firing mpv property observers (`video-format`, `sub-text`) keep Python callbacks alive and processing on every subtitle change.
+
+**Reducing memory usage:** The two highest-impact changes are dropping the render timer from 60fps to 30fps (`setInterval(33)`) and replacing `scale='ewa_lanczossharp'` with `scale='lanczos'`. Together these would recover approximately 30-50MB with minimal perceptible quality difference for typical content.
