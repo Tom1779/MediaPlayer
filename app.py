@@ -19,10 +19,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout
                              QHBoxLayout, QWidget, QFileDialog, QListWidget, QLineEdit, 
                              QSlider, QLabel, QColorDialog, QFontDialog, QMessageBox,
                              QToolTip)
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QGraphicsOpacityEffect
-from PyQt6.QtGui import QShortcut, QKeySequence, QIcon, QPixmap, QColor, QFont
+from PyQt6.QtGui import QShortcut, QKeySequence, QIcon, QPixmap, QColor, QFont, QOpenGLContext
 from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+import ctypes
 
 # --- CYBERPUNK MULTI-PANEL DECK SKIN ---
 STYLESHEET = """
@@ -185,6 +187,202 @@ class ClickableSlider(QSlider):
         else:
             super().mouseReleaseEvent(event)
 
+# --- MPV OPENGL RENDER CONTEXT WIDGET ---
+# Uses MpvRenderContext instead of wid= embedding.
+# This gives us full control over when rendering happens, solving the
+# gpu-next subtitle initialization race that wid= embedding causes.
+# ---------------------------------------------------------------------------
+# AUDIO SUBTITLE OVERLAY
+# For audio-only files, mpv can't render subtitles through the GL pipeline
+# (no video frame to attach them to). Instead we observe the sub-text property
+# and draw the current line ourselves using QPainter on a transparent overlay.
+# ---------------------------------------------------------------------------
+class AudioSubOverlay(QWidget):
+    _sub_text_signal = pyqtSignal(str)  # thread-safe text update
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._text = ''
+        self._font = 'Consolas'
+        self._size = 36
+        self._color = QColor('#00f3ff')
+        self._mpv_ref = None  # set after player init
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet('background: transparent;')
+        self._sub_text_signal.connect(self._apply_sub_text)
+        self._visibility_signal.connect(self._apply_visibility)
+        self.hide()
+
+    _visibility_signal = pyqtSignal(bool)  # thread-safe show/hide
+
+    def set_sub_text(self, text):
+        # Safe to call from any thread — routes through signal
+        self._sub_text_signal.emit(text or '')
+
+    def set_audio_mode(self, enabled):
+        # Safe to call from any thread
+        self._visibility_signal.emit(enabled)
+
+    def _apply_visibility(self, enabled):
+        if enabled:
+            # Size to match video_frame at the moment of showing
+            p = self.parent()
+            if p and hasattr(p, 'findChild'):
+                from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+                vf = p.findChild(QOpenGLWidget)
+                if vf:
+                    self.setGeometry(vf.geometry())
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
+            self._apply_sub_text('')
+
+    def _apply_sub_text(self, text):
+        self._text = text
+        self.update()
+
+    def set_style(self, font, size, color):
+        self._font = font
+        self._size = size
+        self._color = QColor(color)
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._text:
+            return
+        from PyQt6.QtGui import QPainter, QFont, QPen, QFontMetrics
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # mpv's sub-font-size is in script pixels at 720p reference.
+        # Actual render size = sub_font_size * (osd_height / 720).
+        # Read osd_height from mpv if available, else fall back to overlay height.
+        # Read sub-font-size directly from mpv so we match exactly what it renders.
+        # mpv renders at: sub-font-size * (display_height / 720) screen pixels.
+        # We use overlay height as display_height since osd-height is not exposed.
+        try:
+            mpv_size = self._mpv_ref['sub-font-size'] if self._mpv_ref else self._size
+        except Exception:
+            mpv_size = self._size
+        # Apply 0.75 correction — libass adds internal padding that makes
+        # mpv subs appear smaller than raw QPainter text at the same pixel size.
+        scaled_px = max(6, int(mpv_size * self.height() / 720 * 0.75))
+        font = QFont(self._font)
+        font.setPixelSize(scaled_px)
+        painter.setFont(font)
+        fm = QFontMetrics(font)
+        lines = self._text.strip().split('\n')
+        line_h = fm.height() + 4
+        total_h = line_h * len(lines)
+        y_start = self.height() - total_h - 20  # 20px from bottom
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            tw = fm.horizontalAdvance(line)
+            x = (self.width() - tw) // 2
+            y = y_start + i * line_h + fm.ascent()
+            # Draw border
+            border_color = QColor(0, 0, 0, 200)
+            for dx, dy in [(-2,0),(2,0),(0,-2),(0,2),(-1,-1),(1,-1),(-1,1),(1,1)]:
+                painter.setPen(QPen(border_color))
+                painter.drawText(x + dx, y + dy, line)
+            # Draw text
+            painter.setPen(QPen(self._color))
+            painter.drawText(x, y, line)
+        painter.end()
+
+class MpvGLWidget(QOpenGLWidget):
+    """Renders mpv via MpvRenderContext.
+
+    render() is ONLY called inside paintGL() — the only thread-safe place
+    for GL operations in QOpenGLWidget. A 60fps QTimer drives repaints so
+    mpv's render API contract (render() called regularly) is always satisfied.
+    """
+    _schedule_repaint = pyqtSignal()
+    _force_repaint = pyqtSignal()
+
+    def __init__(self, mpv_player, parent=None):
+        super().__init__(parent)
+        self._mpv = mpv_player
+        self._ctx = None
+        self._destroyed = False
+
+        self._schedule_repaint.connect(self.update, Qt.ConnectionType.QueuedConnection)
+        self._force_repaint.connect(self.update)
+        self.frameSwapped.connect(self._on_frame_swapped, Qt.ConnectionType.DirectConnection)
+
+        # Drive repaints at 60fps — this keeps mpv's render API fed.
+        # mpv stops sending update_cb if render() isn't called promptly,
+        # so we render unconditionally at 60fps rather than waiting for callbacks.
+        self._render_timer = QTimer()
+        self._render_timer.setInterval(16)
+        self._render_timer.timeout.connect(self.update)
+        self._render_timer.start()
+
+    def initializeGL(self):
+        from mpv import MpvRenderContext, MpvGlGetProcAddressFn
+
+        def get_proc_addr(_, name):
+            glctx = QOpenGLContext.currentContext()
+            if glctx is None:
+                return 0
+            if isinstance(name, str):
+                name = name.encode('utf-8')
+            addr = glctx.getProcAddress(name)
+            try:
+                return int(addr) if addr else 0
+            except Exception:
+                return 0
+
+        self._get_proc_addr_fn = MpvGlGetProcAddressFn(get_proc_addr)
+        self._ctx = MpvRenderContext(
+            self._mpv, 'opengl',
+            opengl_init_params={'get_proc_address': self._get_proc_addr_fn}
+        )
+        # update_cb still used as a hint to boost repaint rate if needed
+        self._ctx.update_cb = self._on_mpv_update
+
+    def _on_mpv_update(self):
+        """Called from mpv render thread — just schedule a repaint hint."""
+        if not self._destroyed:
+            self._schedule_repaint.emit()
+
+    def paintGL(self):
+        """Called by Qt on the main thread with GL context current.
+        This is the ONLY place we call render() — safe and correct."""
+        if not self._ctx or self._destroyed:
+            return
+        ratio = self.devicePixelRatioF()
+        w = int(self.width() * ratio)
+        h = int(self.height() * ratio)
+        # Always call render() regardless of ctx.update() return value —
+        # this keeps mpv's render API fed and ensures subtitles always draw.
+        self._ctx.render(
+            flip_y=True,
+            opengl_fbo={'fbo': self.defaultFramebufferObject(), 'w': w, 'h': h}
+        )
+
+    def _on_frame_swapped(self):
+        if self._ctx and not self._destroyed:
+            self._ctx.report_swap()
+
+    def resizeGL(self, w, h):
+        self.update()
+
+    def trigger_clear(self):
+        self._force_repaint.emit()
+
+    def cleanup(self):
+        self._destroyed = True
+        self._render_timer.stop()
+        self.makeCurrent()
+        if self._ctx:
+            self._ctx.update_cb = lambda: None
+            self._ctx.free()
+            self._ctx = None
+        self.doneCurrent()
 
 class CyberPlayer(QMainWindow):
     _file_loaded = pyqtSignal()
@@ -259,13 +457,14 @@ class CyberPlayer(QMainWindow):
         self._resize_filter = _ResizeFilter(self)
         QApplication.instance().installEventFilter(self._resize_filter)
 
-        # Initialize MPV Engine
+        # Initialize MPV Engine (render API — no wid=)
+        # MpvRenderContext is created later inside MpvGLWidget.initializeGL(),
+        # which Qt calls once the OpenGL context is fully ready. This eliminates
+        # the gpu-next subtitle initialization race that wid= embedding caused.
         self.player = mpv.MPV(
-            wid=str(int(self.video_frame.winId())),
-            force_window=True,
             keep_open='yes',
             volume_max=150.0,
-            vo='gpu',
+            vo='libmpv',
             sub_ass_override='force',
             sub_ass_force_style='ScaledBorderAndShadow=yes',
             sub_font='Consolas',
@@ -279,7 +478,20 @@ class CyberPlayer(QMainWindow):
             osd_blur=2,
             osd_border_size=3,
             osd_margin_y=45,
+            sub_visibility=True,
+            # --- Quality upgrades via libplacebo (gpu-next pipeline) ---
+            deband=True,               # removes banding on gradients
+            deband_iterations=4,       # strength of debanding
+            deband_threshold=35,       # grain threshold
+            deband_range=16,           # search radius
+            scale='ewa_lanczossharp', # high quality upscaling
+            dscale='mitchell',         # downscaling
+            cscale='sinc',            # chroma upscaling
+            linear_upscaling=True,    # upscale in linear light
+            sigmoid_upscaling=True,   # prevent ringing on upscale
         )
+        # Wire the player into the GL widget so initializeGL() can create the render context
+        self.video_frame._mpv = self.player
         
         try:
             self.player.sub_use_osd = True
@@ -296,6 +508,21 @@ class CyberPlayer(QMainWindow):
 
         self.player.observe_property('track-list', _on_track_list_change)
         self._on_track_list_cb = _on_track_list_change
+
+        def _on_video_format(name, value):
+            is_audio_only = value is None
+            if hasattr(self, 'video_frame'):
+                self.video_frame.trigger_clear()
+            if hasattr(self, 'audio_sub_overlay'):
+                self.audio_sub_overlay.set_audio_mode(is_audio_only)
+        self.player.observe_property('video-format', _on_video_format)
+        self._on_video_format_cb = _on_video_format
+
+        def _on_sub_text(name, value):
+            if hasattr(self, 'audio_sub_overlay'):
+                self.audio_sub_overlay.set_sub_text(value or '')
+        self.player.observe_property('sub-text', _on_sub_text)
+        self._on_sub_text_cb = _on_sub_text
 
         @self.player.event_callback('file-loaded')
         def _on_file_loaded(_event):
@@ -478,12 +705,8 @@ class CyberPlayer(QMainWindow):
         self.viewport_container.setContentsMargins(0, 0, 0, 0)
         viewport_layout.setSpacing(0)
         
-        self.video_frame = QWidget()
-        self.video_frame.setStyleSheet("background-color: #000000;")
+        self.video_frame = MpvGLWidget(None, self)  # mpv player attached later in __init__
         self.video_frame.mousePressEvent = lambda e: self.toggle_play() if e.button() == Qt.MouseButton.LeftButton and not getattr(self, '_is_switching', False) else None
-        
-        video_overlay_layout = QVBoxLayout(self.video_frame)
-        video_overlay_layout.addStretch()
 
         viewport_layout.addWidget(self.video_frame, stretch=1)
         
@@ -491,23 +714,23 @@ class CyberPlayer(QMainWindow):
         self.bottom_bar = QWidget(self.viewport_container)
         self.bottom_bar.setObjectName("BottomBar")
 
-        # Pause/play flash overlay — floats over viewport_container, above mpv's render surface
-        # Pause overlay must be a separate top-level window to render transparently
-        # over mpv's native render surface (airspace problem — Qt can't alpha-blend
-        # over a foreign GPU surface, but the OS compositor can blend two windows).
-        self.pause_overlay = QLabel(None, 
-            Qt.WindowType.FramelessWindowHint | 
-            Qt.WindowType.Tool |
-            Qt.WindowType.WindowTransparentForInput |
-            Qt.WindowType.WindowStaysOnTopHint
-        )
+        # Pause/play flash overlay — simple child widget of video_frame.
+        # With the render API (MpvGLWidget), Qt composites normally over the OpenGL
+        # surface — the airspace problem that required a separate top-level window
+        # is gone. We can just use a regular child label with a transparent background.
+        self.pause_overlay = QLabel(self.video_frame)
         self.pause_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pause_overlay.setStyleSheet(
             "color: white; font-size: 64px; font-weight: bold; background: transparent;"
         )
         self.pause_overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.pause_overlay.setFixedSize(100, 100)
+        self.pause_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.pause_overlay.hide()
+
+        # Subtitle overlay for audio-only files
+        self.audio_sub_overlay = AudioSubOverlay(self.viewport_container)
+        self.audio_sub_overlay.hide()
 
         self.bottom_bar.setFixedHeight(85)
         bottom_layout = QVBoxLayout(self.bottom_bar)
@@ -699,6 +922,9 @@ class CyberPlayer(QMainWindow):
     def safely_handle_app_exit(self):
         self._save_throttle.stop()
         self.save_configuration_memory()  # flush immediately on exit
+        # Clean up the mpv render context before the GL context is destroyed
+        if hasattr(self, 'video_frame') and hasattr(self.video_frame, 'cleanup'):
+            self.video_frame.cleanup()
         self.close()
 
     def calculate_boosted_volume(self, value):
@@ -778,13 +1004,21 @@ class CyberPlayer(QMainWindow):
             ('osd-color',        color),
             ('osd-border-color', '#000000'),
             ('osd-border-size',  1.0),
+            # Force subtitles visible even for audio-only files.
+            # Without this, mpv disables sub rendering when there is no video track.
+            ('sub-visibility',   'yes'),
         ]:
             try:
                 self.player[prop] = val
             except Exception as e:
                 print(f"Sub style error {prop}: {e}")
-        
-
+        # Keep audio subtitle overlay in sync with style settings
+        if hasattr(self, 'audio_sub_overlay'):
+            self.audio_sub_overlay.set_style(
+                self.current_sub_font,
+                int(self.current_sub_size),
+                self.current_sub_color
+            )
 
     def update_timeline(self):
         if self.is_awaiting_resume and not self.slider.is_user_dragging:
@@ -830,7 +1064,6 @@ class CyberPlayer(QMainWindow):
                         self._schedule_save()
             except:
                 pass
-
 
     def skip_forward(self):
         if self.player.time_pos is not None: self.player.time_pos += 5.0
@@ -1007,6 +1240,13 @@ class CyberPlayer(QMainWindow):
             saved_sub_path = "auto"
 
         try:
+            # Reset sub state before every load so previous file's sub settings
+            # don't persist (e.g. explicit sub_file from mp4 blocking fuzzy match on mp3)
+            try:
+                self.player['sub-auto'] = 'fuzzy'
+                self.player['sid'] = 'auto'
+            except Exception:
+                pass
             if saved_sub_path == "none":
                 self.player.loadfile(norm_path, 'replace', sid='no', sub_auto='no')
             elif saved_sub_path == "auto":
@@ -1062,14 +1302,10 @@ class CyberPlayer(QMainWindow):
             self.load_subtitle_from_path(action)
 
     def handle_visual_frame_adjustments(self, filepath):
-        _, ext = os.path.splitext(filepath.lower())
-        if ext in ['.mp3', '.flac', '.wav']:
-            self.video_frame.setStyleSheet(
-                "background-color: #030303; border-bottom: 1px solid rgba(255, 0, 234, 0.2); "
-                "background-image: radial-gradient(circle, #0e0e0e 15%, transparent 16%); background-size: 12px 12px;"
-            )
-        else:
-            self.video_frame.setStyleSheet("background-color: #000000; border: none;")
+        # With the render API (QOpenGLWidget), mpv controls the surface entirely —
+        # setStyleSheet has no effect on the GL framebuffer. For audio-only files,
+        # mpv renders a black frame naturally. No action needed here.
+        pass
 
     def prompt_user_playback_resume(self, target_seconds):
         try:
@@ -1114,15 +1350,12 @@ class CyberPlayer(QMainWindow):
     def _reposition_pause_overlay(self):
         if not hasattr(self, 'pause_overlay'):
             return
+        # Overlay is a child of video_frame — just center it within the frame
         size = 100
-        vc = self.viewport_container
-        bar_height = self.bottom_bar.height() if hasattr(self, 'bottom_bar') else 0
-        video_height = vc.height() - bar_height
-        # Map to global coords since overlay is a top-level window
-        global_pos = vc.mapToGlobal(vc.rect().topLeft())
+        vf = self.video_frame
         self.pause_overlay.move(
-            global_pos.x() + (vc.width() - size) // 2,
-            global_pos.y() + (video_height - size) // 2,
+            (vf.width() - size) // 2,
+            (vf.height() - size) // 2,
         )
 
     def moveEvent(self, event):
@@ -1131,6 +1364,8 @@ class CyberPlayer(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "audio_sub_overlay") and hasattr(self, "video_frame"):
+            self.audio_sub_overlay.setGeometry(self.video_frame.geometry())
         self._reposition_pause_overlay()
         if hasattr(self, 'pause_overlay') and self.pause_overlay.isVisible():
             self.pause_overlay.raise_()
@@ -1234,12 +1469,6 @@ class CyberPlayer(QMainWindow):
             from PyQt6.QtCore import QEvent
             if event.type() == QEvent.Type.WindowStateChange:
                 if self.isMinimized():
-                    self.pause_overlay.hide()
-                elif self._user_paused:
-                    self._reposition_pause_overlay()
-                    self.pause_overlay.show()
-            elif event.type() == QEvent.Type.ActivationChange:
-                if not self.isActiveWindow():
                     self.pause_overlay.hide()
                 elif self._user_paused:
                     self._reposition_pause_overlay()
@@ -1502,26 +1731,22 @@ class CyberPlayer(QMainWindow):
         self.oldPos = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
-
 # --- WINDOWS BOOTSTRAP INTERCEPTOR ---
 if __name__ == '__main__':
-    # Set AUMID before QApplication so Windows assigns the taskbar button
-    # to this process and reads the icon from the embedded exe resource.
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(u'CyberPlayer.App.1')
     except Exception:
         pass
 
+    # Force desktop OpenGL (not ANGLE/D3D emulation) so MpvRenderContext
+    # gets a real GL context that mpv can render into.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL)
     app = QApplication(sys.argv)
-
-    # bundle_dir points to sys._MEIPASS when frozen (where icon.ico is extracted),
-    # and to exe_dir in dev — this is the fix for the taskbar icon not showing.
     icon_path = os.path.join(bundle_dir, 'icon.ico')
     if os.path.exists(icon_path):
         app_icon = QIcon(icon_path)
         app.setWindowIcon(app_icon)
-
     app.setStyleSheet("""
         QToolTip {
             background-color: #0a0a0a;
@@ -1537,9 +1762,17 @@ if __name__ == '__main__':
         player.setWindowIcon(app_icon)
     player.show()
 
+    # Force GL context initialization before any file is loaded.
+    # Without this, Qt calls initializeGL lazily after the first paint,
+    # which may be after mpv has already tried to init vo=libmpv and given up.
+    app.processEvents()  # flush pending paint events so initializeGL runs now
+    player.video_frame.makeCurrent()
+    player.video_frame.doneCurrent()
+    app.processEvents()  # allow mpv to process the new render context
+
     if len(sys.argv) > 1:
         target_file = os.path.normpath(sys.argv[1]).lower().replace('\\', '/')
         if os.path.exists(target_file):
             QTimer.singleShot(250, lambda: player.play_file(target_file))
-
+            
     sys.exit(app.exec())
